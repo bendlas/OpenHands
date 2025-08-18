@@ -34,6 +34,12 @@ export const useAutoLogin = () => {
     authUrl: config?.AUTH_URL,
   });
 
+  const giteaAuthUrl = useAuthUrl({
+    appMode: config?.APP_MODE || null,
+    identityProvider: "gitea",
+    authUrl: config?.AUTH_URL,
+  });
+
   const enterpriseSsoUrl = useAuthUrl({
     appMode: config?.APP_MODE || null,
     identityProvider: "enterprise_sso",
@@ -69,6 +75,8 @@ export const useAutoLogin = () => {
       authUrl = gitlabAuthUrl;
     } else if (loginMethod === LoginMethod.BITBUCKET) {
       authUrl = bitbucketAuthUrl;
+    } else if (loginMethod === LoginMethod.GITEA) {
+      authUrl = giteaAuthUrl;
     } else if (loginMethod === LoginMethod.ENTERPRISE_SSO) {
       authUrl = enterpriseSsoUrl;
     }
@@ -91,6 +99,7 @@ export const useAutoLogin = () => {
     githubAuthUrl,
     gitlabAuthUrl,
     bitbucketAuthUrl,
+    giteaAuthUrl,
     enterpriseSsoUrl,
   ]);
 };
