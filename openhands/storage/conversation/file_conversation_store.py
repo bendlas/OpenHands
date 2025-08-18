@@ -28,6 +28,7 @@ conversation_metadata_type_adapter = TypeAdapter(ConversationMetadata)
 @dataclass
 class FileConversationStore(ConversationStore):
     file_store: FileStore
+    user_id: str | None = None
 
     async def save_metadata(self, metadata: ConversationMetadata) -> None:
         json_str = conversation_metadata_type_adapter.dump_json(metadata)
@@ -72,18 +73,18 @@ class FileConversationStore(ConversationStore):
         conversations: list[ConversationMetadata] = []
         metadata_dir = self.get_conversation_metadata_dir()
         try:
-            conversation_ids = [
-                Path(path).name
+            conversation_dirs = [
+                Path(path).name.rstrip('/')
                 for path in self.file_store.list(metadata_dir)
                 if not Path(path).name.startswith('.')
             ]
         except FileNotFoundError:
             return ConversationMetadataResultSet([])
-        num_conversations = len(conversation_ids)
+        num_conversations = len(conversation_dirs)
         start = page_id_to_offset(page_id)
         end = min(limit + start, num_conversations)
         conversations = []
-        for conversation_id in conversation_ids:
+        for conversation_id in conversation_dirs:
             try:
                 conversations.append(await self.get_metadata(conversation_id))
             except Exception:
@@ -96,10 +97,13 @@ class FileConversationStore(ConversationStore):
         return ConversationMetadataResultSet(conversations, next_page_id)
 
     def get_conversation_metadata_dir(self) -> str:
+        # Root directory containing conversation subdirectories
+        if self.user_id:
+            return f'users/{self.user_id}/conversations/'
         return CONVERSATION_BASE_DIR
 
     def get_conversation_metadata_filename(self, conversation_id: str) -> str:
-        return get_conversation_metadata_filename(conversation_id)
+        return get_conversation_metadata_filename(conversation_id, self.user_id)
 
     @classmethod
     async def get_instance(
@@ -112,7 +116,7 @@ class FileConversationStore(ConversationStore):
             file_store_web_hook_headers=config.file_store_web_hook_headers,
             file_store_web_hook_batch=config.file_store_web_hook_batch,
         )
-        return FileConversationStore(file_store)
+        return FileConversationStore(file_store=file_store, user_id=user_id)
 
 
 def _sort_key(conversation: ConversationMetadata) -> str:

@@ -46,4 +46,6 @@ class FileSecretsStore(SecretsStore):
             file_store_web_hook_headers=config.file_store_web_hook_headers,
             file_store_web_hook_batch=config.file_store_web_hook_batch,
         )
-        return FileSecretsStore(file_store)
+        # Scope secrets to user directory if user_id is provided
+        path = f'users/{user_id}/secrets.json' if user_id else 'secrets.json'
+        return FileSecretsStore(file_store=file_store, path=path)

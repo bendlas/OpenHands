@@ -350,6 +350,41 @@ class OpenHandsMCPConfig:
         if search_engine_stdio_server:
             stdio_servers.append(search_engine_stdio_server)
 
+        # Optional: auto-add Gitea/Forgejo MCP stdio server from environment
+        # Configure with:
+        #   GITEA_MCP_ENABLE=1
+        #   GITEA_MCP_COMMAND=gitea-mcp (optional)
+        #   GITEA_MCP_ARGS="-t stdio" (optional)
+        #   GITEA_ACCESS_TOKEN, GITEA_HOST, GITEA_INSECURE (optional)
+        try:
+            if os.getenv('GITEA_MCP_ENABLE', '0') == '1':
+                command = os.getenv('GITEA_MCP_COMMAND', 'gitea-mcp')
+                args = os.getenv('GITEA_MCP_ARGS', '-t stdio')
+                # Parse args string to list safely
+                import shlex as _shlex
+
+                parsed_args = []
+                if args:
+                    try:
+                        parsed_args = _shlex.split(args)
+                    except Exception:
+                        logger.warning(
+                            'Failed to parse GITEA_MCP_ARGS, using raw split'
+                        )
+                        parsed_args = args.split()
+                env_vars = {}
+                for key in ['GITEA_ACCESS_TOKEN', 'GITEA_HOST', 'GITEA_INSECURE']:
+                    val = os.getenv(key)
+                    if val:
+                        env_vars[key] = val
+                stdio_servers.append(
+                    MCPStdioServerConfig(
+                        name='gitea', command=command, args=parsed_args, env=env_vars
+                    )
+                )
+        except Exception as e:
+            logger.warning(f'Failed to configure Gitea MCP from env: {e}')
+
         shttp_servers = MCPSHTTPServerConfig(url=f'http://{host}/mcp/mcp', api_key=None)
 
         return shttp_servers, stdio_servers
