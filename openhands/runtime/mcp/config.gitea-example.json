@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "default": {},
+    "gitea": {
+      "command": "npx",
+      "args": ["@gitea/mcp-server"],
+      "env": {
+        "GITEA_URL": "https://git.example.com",
+        "GITEA_TOKEN": "${GITEA_TOKEN}"
+      }
+    }
+  },
+  "tools": []
+}

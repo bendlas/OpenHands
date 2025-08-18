@@ -1,0 +1,31 @@
+[core]
+# Use Authelia for authentication in self-hosted environments
+user_auth_class = "openhands.server.user_auth.authelia_user_auth.AutheliaUserAuth"
+
+# JWT secret for session management (change this!)
+jwt_secret = "your-secret-key-here"
+
+# Workspace configuration
+workspace_base = "./workspace"
+cache_dir = "/tmp/cache"
+
+[llm]
+# Configure your LLM
+model = "gpt-4o"
+api_key = ""  # Set via environment variable or user settings
+
+[agent]
+# Enable tools
+enable_browsing = true
+enable_editor = true
+enable_jupyter = true
+enable_cmd = true
+
+[sandbox]
+# Container configuration for self-hosted
+base_container_image = "nikolaik/python-nodejs:python3.12-nodejs22"
+timeout = 120
+
+# Example environment variables to set:
+# export GITEA_TOKEN="gta_xxxxxxxxxxxx"
+# export GITEA_URL="https://git.example.com"
