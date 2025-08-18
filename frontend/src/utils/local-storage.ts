@@ -8,6 +8,7 @@ export enum LoginMethod {
   GITHUB = "github",
   GITLAB = "gitlab",
   BITBUCKET = "bitbucket",
+  GITEA = "gitea",
   ENTERPRISE_SSO = "enterprise_sso",
 }
 
