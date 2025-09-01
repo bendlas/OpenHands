@@ -48,8 +48,8 @@
           netcat-gnu
         ];
 
-      in
-      {
+      in {
+        devShells.alt1 = pkgs.callPackage ./shell.nix {};
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             python312
