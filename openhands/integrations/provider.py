@@ -20,6 +20,8 @@ from openhands.events.stream import EventStream
 from openhands.integrations.bitbucket.bitbucket_service import BitBucketServiceImpl
 from openhands.integrations.github.github_service import GithubServiceImpl
 from openhands.integrations.gitlab.gitlab_service import GitLabServiceImpl
+from openhands.integrations.gitea.gitea_service import GiteaServiceImpl
+from openhands.integrations.forgejo.forgejo_service import ForgejoServiceImpl
 from openhands.integrations.service_types import (
     AuthenticationError,
     Branch,
@@ -108,6 +110,8 @@ class ProviderHandler:
         ProviderType.GITHUB: 'github.com',
         ProviderType.GITLAB: 'gitlab.com',
         ProviderType.BITBUCKET: 'bitbucket.org',
+        ProviderType.GITEA: 'gitea.com',
+        ProviderType.FORGEJO: 'codeberg.org',
     }
 
     def __init__(
@@ -128,6 +132,8 @@ class ProviderHandler:
             ProviderType.GITHUB: GithubServiceImpl,
             ProviderType.GITLAB: GitLabServiceImpl,
             ProviderType.BITBUCKET: BitBucketServiceImpl,
+            ProviderType.GITEA: GiteaServiceImpl,
+            ProviderType.FORGEJO: ForgejoServiceImpl,
         }
 
         self.external_auth_id = external_auth_id
