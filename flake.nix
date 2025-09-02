@@ -14,17 +14,55 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        inherit (poetry2nix.lib.mkPoetry2Nix { inherit pkgs; }) mkPoetryApplication defaultPoetryOverrides;
 
-        # Check if we're on WSL
+        ## Check if we're on WSL
         isWSL = builtins.pathExists /proc/sys/fs/binfmt_misc/WSLInterop;
 
-        # Python 3.12 with development headers
-        python312 = pkgs.python312;
+        python = pkgs.python312.withPackages (ps: with ps; [
+          pip
+          setuptools
+          wheel
+          pytest
+          ruff
+          black
+          cleo
+          uvicorn
+          python-socketio
+          fastapi
+          python-dotenv
+        ]);
 
-        # Poetry 1.8.x
+        nodejs = pkgs.nodejs_22;
+
+        poetryApp = mkPoetryApplication {
+          projectDir = ./.;
+          python = pkgs.python312;
+          # preferWheels = true;
+          extras = [ ];
+          # overrides = (self: super: {
+          #   # inherit (pkgs.python312.pkgs) playwright flit-core;
+          # });
+          overrides = defaultPoetryOverrides.extend (self: super: {
+            inherit (pkgs.python312.pkgs) ruff;
+            types-typed-ast = null; # super.types-typed-ast or null;
+            # ruff = null;
+            # uvicorn = null;
+          });
+        };
+
+        ## Poetry 1.8.x
         poetry = pkgs.poetry;
 
-        # Build essential tools
+        baseTools = with pkgs; [
+          uv
+          python
+          nodejs
+          poetry
+          pre-commit
+        ];
+
+        ## Build essential tools
         buildTools = with pkgs; [
           gcc
           gnumake
@@ -35,47 +73,66 @@
           libtool
         ];
 
-        # Development headers for Python
-        pythonDev = with pkgs; [
-          python312.pkgs.pip
-          python312.pkgs.setuptools
-          python312.pkgs.wheel
-          # Python development headers are included with python312
-        ];
-
-        # Optional WSL-specific tools
+        ## Optional WSL-specific tools
         wslTools = with pkgs; lib.optionals isWSL [
           netcat-gnu
         ];
 
       in {
-        devShells.alt1 = pkgs.callPackage ./shell.nix {};
-        devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            python312
-            nodejs_22
-            poetry
-            pre-commit
-          ] ++ buildTools ++ pythonDev ++ wslTools;
 
-          shellHook = ''
+        apps.default = {
+          type = "app";
+          program = "${poetryApp}/bin/openhands";
+        };
+
+        apps.poetry = {
+          type = "app";
+          program = "${poetryApp}/bin/$1";
+        };
+
+        packages.default = poetryApp;
+
+        devShells.default = pkgs.mkShellNoCC {
+          buildInputs = baseTools ++ buildTools ++ wslTools;
+
+          venvDir = "./.venv";
+          nativeBuildInputs = [ python.pkgs.venvShellHook ];
+
+          postShellHook = ''
             echo "Development environment loaded!"
             echo "Python: $(python --version)"
             echo "Node.js: $(node --version)"
             echo "Poetry: $(poetry --version)"
             echo "GCC: $(gcc --version | head -n1)"
+            echo "UV: $(uv --version)"
+            echo "Ruff: $(ruff --version)"
+            echo "Black: $(black --version)"
             ${if isWSL then ''echo "WSL detected - netcat included"'' else ""}
             echo ""
             echo "All development dependencies are ready."
           '';
 
-          # Set up environment variables
-          PYTHON = "${python312}/bin/python";
-          NODE_PATH = "${pkgs.nodejs_22}/lib/node_modules";
+          ## Set up environment variables
+          PYTHON = "${python}/bin/python";
+          NODE_PATH = "${nodejs}/lib/node_modules";
 
-          # Ensure Python can find its headers
-          C_INCLUDE_PATH = "${python312}/include/python3.12";
-          CPLUS_INCLUDE_PATH = "${python312}/include/python3.12";
+          ## Ensure Python can find its headers
+          C_INCLUDE_PATH = "${python}/include/${python.libPrefix}";
+          CPLUS_INCLUDE_PATH = "${python}/include/${python.libPrefix}";
+          
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [stdenv.cc.cc.lib ffmpeg]);
+
+          # postShellHook = ''
+          #   export SANDBOX_RUNTIME_CONTAINER_IMAGE=docker.all-hands.dev/all-hands-ai/runtime:0.48-nikolaik
+          #   export SANDBOX_VOLUMES="$(pwd):/workspace:rw"
+          #   export SANDBOX_USER_ID=$(id -u)
+          #   if [[ -f .env ]]; then
+          #     set -a
+          #     source .env
+          #     set +a
+          #   fi
+          # '';
+
         };
       });
 }
