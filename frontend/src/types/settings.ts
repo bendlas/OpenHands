@@ -2,6 +2,8 @@ export const ProviderOptions = {
   github: "github",
   gitlab: "gitlab",
   bitbucket: "bitbucket",
+  gitea: "gitea",
+  forgejo: "forgejo",
   enterprise_sso: "enterprise_sso",
 } as const;
 

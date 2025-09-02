@@ -179,12 +179,15 @@ class ProviderHandler:
         self, provider: ProviderType
     ) -> SecretStr | None:
         """Get latest token from service"""
+        if not self.REFRESH_TOKEN_URL:
+            return None
+            
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     self.REFRESH_TOKEN_URL,
                     headers={
-                        'X-Session-API-Key': self.session_api_key,
+                        'X-Session-API-Key': self.session_api_key or '',
                     },
                     params={'provider': provider.value, 'sid': self.sid},
                 )
@@ -373,20 +376,20 @@ class ProviderHandler:
         return exposed_envs
 
     @overload
-    def get_env_vars(
+    async def get_env_vars(
         self,
         expose_secrets: Literal[True],
         providers: list[ProviderType] | None = ...,
         get_latest: bool = False,
-    ) -> Coroutine[Any, Any, dict[str, str]]: ...
+    ) -> dict[str, str]: ...
 
     @overload
-    def get_env_vars(
+    async def get_env_vars(
         self,
         expose_secrets: Literal[False],
         providers: list[ProviderType] | None = ...,
         get_latest: bool = False,
-    ) -> Coroutine[Any, Any, dict[ProviderType, SecretStr]]: ...
+    ) -> dict[ProviderType, SecretStr]: ...
 
     async def get_env_vars(
         self,
