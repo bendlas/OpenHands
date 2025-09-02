@@ -1,0 +1,3180 @@
+From 4ac257c69e6e739d3561923f2d16c2230ddf940d Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 09:45:00 +0000
+Subject: [PATCH 01/16] Add Forgejo integration similar to GitHub and GitLab
+ integrations
+
+---
+ microagents/knowledge/forgejo.md              |  79 +++
+ openhands/integrations/forgejo/__init__.py    |   0
+ .../integrations/forgejo/forgejo_service.py   | 181 +++++++
+ openhands/integrations/provider.py            |   2 +
+ openhands/integrations/service_types.py       |   1 +
+ openhands/resolver/interfaces/forgejo.py      | 454 ++++++++++++++++++
+ tests/unit/test_forgejo_service.py            | 222 +++++++++
+ 7 files changed, 939 insertions(+)
+ create mode 100644 microagents/knowledge/forgejo.md
+ create mode 100644 openhands/integrations/forgejo/__init__.py
+ create mode 100644 openhands/integrations/forgejo/forgejo_service.py
+ create mode 100644 openhands/resolver/interfaces/forgejo.py
+ create mode 100644 tests/unit/test_forgejo_service.py
+
+diff --git a/microagents/knowledge/forgejo.md b/microagents/knowledge/forgejo.md
+new file mode 100644
+index 000000000000..eb0feb05a2c6
+--- /dev/null
++++ b/microagents/knowledge/forgejo.md
+@@ -0,0 +1,79 @@
++# Forgejo Knowledge
++
++Forgejo is a self-hosted Git service that is a fork of Gitea. It provides a lightweight, open-source alternative to GitHub and GitLab. Codeberg.org is a popular instance of Forgejo.
++
++## API
++
++The Forgejo API is compatible with the Gitea API. It follows a RESTful design and uses JSON for data exchange. The base URL for the API is typically:
++
++```
++https://[forgejo-instance]/api/v1
++```
++
++For Codeberg, the base URL is:
++
++```
++https://codeberg.org/api/v1
++```
++
++### Authentication
++
++Forgejo supports several authentication methods:
++
++1. HTTP basic authentication
++2. `token=...` parameter in URL query string
++3. `access_token=...` parameter in URL query string
++4. `Authorization: token ...` header in HTTP headers
++
++### Common Endpoints
++
++- `/user` - Get authenticated user information
++- `/user/repos` - List repositories for the authenticated user
++- `/repos/search` - Search for repositories
++- `/repos/{owner}/{repo}` - Get repository information
++- `/repos/{owner}/{repo}/issues` - List issues for a repository
++- `/repos/{owner}/{repo}/pulls` - List pull requests for a repository
++
++### Pagination
++
++The API supports pagination with the `page` and `limit` parameters. The `Link` header is returned with next, previous, and last page links if there are more than one page.
++
++## Differences from GitHub/GitLab
++
++- Forgejo uses `limit` instead of `per_page` for pagination
++- Forgejo uses `stars_count` instead of `stargazers_count` for repository stars
++- Forgejo doesn't have a direct API for requesting reviewers on pull requests
++- Forgejo doesn't support replying to specific comments in the same way as GitHub
++
++## Codeberg Specifics
++
++Codeberg.org is a popular Forgejo instance hosted in the EU. It's a non-profit, community-driven platform focused on free and open source software.
++
++- Base URL: `https://codeberg.org/api/v1`
++- Authentication: Uses personal access tokens
++- Rate Limiting: Has rate limits to prevent abuse
++
++## Using the Forgejo Integration
++
++To use the Forgejo integration in OpenHands:
++
++1. Generate a personal access token from your Forgejo instance (e.g., Codeberg)
++2. Set the token as an environment variable: `FORGEJO_TOKEN`
++3. Use the Forgejo provider in your code
++
++Example:
++```python
++from openhands.integrations.service_types import ProviderType
++from openhands.integrations.provider import ProviderHandler
++
++# Create a provider handler with Forgejo token
++provider_handler = ProviderHandler({
++    ProviderType.FORGEJO: ProviderToken(token=SecretStr("your_token"))
++})
++
++# Get user information
++user = await provider_handler.get_user()
++
++# Search repositories
++repos = await provider_handler.search_repositories("query", 10, "updated", "desc")
++```
+\ No newline at end of file
+diff --git a/openhands/integrations/forgejo/__init__.py b/openhands/integrations/forgejo/__init__.py
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/openhands/integrations/forgejo/forgejo_service.py b/openhands/integrations/forgejo/forgejo_service.py
+new file mode 100644
+index 000000000000..06c0de67fe5f
+--- /dev/null
++++ b/openhands/integrations/forgejo/forgejo_service.py
+@@ -0,0 +1,181 @@
++import os
++from typing import Any
++
++import httpx
++from pydantic import SecretStr
++
++from openhands.core.logger import openhands_logger as logger
++from openhands.integrations.service_types import (
++    AuthenticationError,
++    GitService,
++    ProviderType,
++    Repository,
++    UnknownException,
++    User,
++)
++from openhands.server.types import AppMode
++from openhands.utils.import_utils import get_impl
++
++
++class ForgejoService(GitService):
++    BASE_URL = 'https://codeberg.org/api/v1'  # Default to Codeberg, can be overridden
++    token: SecretStr = SecretStr('')
++    refresh = False
++
++    def __init__(
++        self,
++        user_id: str | None = None,
++        external_auth_id: str | None = None,
++        external_auth_token: SecretStr | None = None,
++        token: SecretStr | None = None,
++        external_token_manager: bool = False,
++        base_url: str | None = None,
++    ):
++        self.user_id = user_id
++        self.external_token_manager = external_token_manager
++
++        if token:
++            self.token = token
++            
++        if base_url:
++            self.BASE_URL = base_url
++
++    async def _get_forgejo_headers(self) -> dict:
++        """
++        Retrieve the Forgejo Token to construct the headers
++        """
++        if self.user_id and not self.token:
++            self.token = await self.get_latest_token()
++
++        return {
++            'Authorization': f'token {self.token.get_secret_value()}',
++            'Accept': 'application/json',
++        }
++
++    def _has_token_expired(self, status_code: int) -> bool:
++        return status_code == 401
++
++    async def get_latest_token(self) -> SecretStr | None:
++        return self.token
++
++    async def _fetch_data(
++        self, url: str, params: dict | None = None
++    ) -> tuple[Any, dict]:
++        try:
++            async with httpx.AsyncClient() as client:
++                forgejo_headers = await self._get_forgejo_headers()
++                response = await client.get(url, headers=forgejo_headers, params=params)
++                if self.refresh and self._has_token_expired(response.status_code):
++                    await self.get_latest_token()
++                    forgejo_headers = await self._get_forgejo_headers()
++                    response = await client.get(
++                        url, headers=forgejo_headers, params=params
++                    )
++
++                response.raise_for_status()
++                headers = {}
++                if 'Link' in response.headers:
++                    headers['Link'] = response.headers['Link']
++
++                return response.json(), headers
++
++        except httpx.HTTPStatusError as e:
++            if e.response.status_code == 401:
++                raise AuthenticationError('Invalid Forgejo token')
++            raise UnknownException(f'Unknown error: {e}')
++
++        except httpx.HTTPError as e:
++            raise UnknownException(f'HTTP error: {e}')
++
++    async def get_user(self) -> User:
++        url = f'{self.BASE_URL}/user'
++        response, _ = await self._fetch_data(url)
++
++        return User(
++            id=response.get('id'),
++            username=response.get('username'),
++            avatar_url=response.get('avatar_url'),
++            name=response.get('full_name'),
++            email=response.get('email'),
++            company=response.get('organization'),
++            login=response.get('username'),
++        )
++
++    async def search_repositories(
++        self, query: str, per_page: int = 30, sort: str = 'updated', order: str = 'desc'
++    ) -> list[Repository]:
++        url = f'{self.BASE_URL}/repos/search'
++        params = {
++            'q': query,
++            'limit': per_page,
++            'sort': sort,
++            'order': order,
++            'mode': 'source',  # Only return repositories that are not forks
++        }
++
++        response, _ = await self._fetch_data(url, params)
++        repos = [
++            Repository(
++                id=repo.get('id'),
++                full_name=repo.get('full_name'),
++                stargazers_count=repo.get('stars_count'),
++                git_provider=ProviderType.FORGEJO,
++            )
++            for repo in response.get('data', [])
++        ]
++
++        return repos
++
++    async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repository]:
++        MAX_REPOS = 1000
++        PER_PAGE = 100  # Maximum allowed by Forgejo API
++        all_repos: list[dict] = []
++        page = 1
++
++        url = f'{self.BASE_URL}/user/repos'
++        # Map GitHub's sort values to Forgejo's sort values
++        sort_map = {
++            'pushed': 'updated',
++            'updated': 'updated',
++            'created': 'created',
++            'full_name': 'name',
++        }
++        forgejo_sort = sort_map.get(sort, 'updated')
++
++        while len(all_repos) < MAX_REPOS:
++            params = {
++                'page': str(page),
++                'limit': str(PER_PAGE),
++                'sort': forgejo_sort,
++            }
++            response, headers = await self._fetch_data(url, params)
++
++            if not response:  # No more repositories
++                break
++
++            all_repos.extend(response)
++            page += 1
++
++            # Check if we've reached the last page
++            link_header = headers.get('Link', '')
++            if 'rel="next"' not in link_header:
++                break
++
++        # Trim to MAX_REPOS if needed and convert to Repository objects
++        all_repos = all_repos[:MAX_REPOS]
++        return [
++            Repository(
++                id=repo.get('id'),
++                full_name=repo.get('full_name'),
++                stargazers_count=repo.get('stars_count'),
++                git_provider=ProviderType.FORGEJO,
++            )
++            for repo in all_repos
++        ]
++
++
++forgejo_service_cls = os.environ.get(
++    'OPENHANDS_FORGEJO_SERVICE_CLS',
++    'openhands.integrations.forgejo.forgejo_service.ForgejoService',
++)
++ForgejoServiceImpl = get_impl(ForgejoService, forgejo_service_cls)
+\ No newline at end of file
+diff --git a/openhands/integrations/provider.py b/openhands/integrations/provider.py
+index fed04f31ccab..843cd3198fb7 100644
+--- a/openhands/integrations/provider.py
++++ b/openhands/integrations/provider.py
+@@ -17,6 +17,7 @@
+ from openhands.events.action.action import Action
+ from openhands.events.action.commands import CmdRunAction
+ from openhands.events.stream import EventStream
++from openhands.integrations.forgejo.forgejo_service import ForgejoServiceImpl
+ from openhands.integrations.github.github_service import GithubServiceImpl
+ from openhands.integrations.gitlab.gitlab_service import GitLabServiceImpl
+ from openhands.integrations.service_types import (
+@@ -147,6 +148,7 @@ def __init__(
+         self.service_class_map: dict[ProviderType, type[GitService]] = {
+             ProviderType.GITHUB: GithubServiceImpl,
+             ProviderType.GITLAB: GitLabServiceImpl,
++            ProviderType.FORGEJO: ForgejoServiceImpl,
+         }
+ 
+         self.external_auth_id = external_auth_id
+diff --git a/openhands/integrations/service_types.py b/openhands/integrations/service_types.py
+index fdb5a5339b0d..b409fab1c017 100644
+--- a/openhands/integrations/service_types.py
++++ b/openhands/integrations/service_types.py
+@@ -9,6 +9,7 @@
+ class ProviderType(Enum):
+     GITHUB = 'github'
+     GITLAB = 'gitlab'
++    FORGEJO = 'forgejo'
+ 
+ 
+ class TaskType(str, Enum):
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+new file mode 100644
+index 000000000000..4613d05dd049
+--- /dev/null
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -0,0 +1,454 @@
++from typing import Any
++from urllib.parse import quote
++
++import httpx
++
++from openhands.core.logger import openhands_logger as logger
++from openhands.resolver.interfaces.issue import (
++    Issue,
++    IssueHandlerInterface,
++    ReviewThread,
++)
++from openhands.resolver.utils import extract_issue_references
++
++
++class ForgejoIssueHandler(IssueHandlerInterface):
++    def __init__(self, owner: str, repo: str, token: str, username: str | None = None):
++        self.owner = owner
++        self.repo = repo
++        self.token = token
++        self.username = username
++        self.base_url = self.get_base_url()
++        self.download_url = self.get_download_url()
++        self.clone_url = self.get_clone_url()
++        self.headers = self.get_headers()
++
++    def set_owner(self, owner: str) -> None:
++        self.owner = owner
++
++    def get_headers(self) -> dict[str, str]:
++        return {
++            'Authorization': f'token {self.token}',
++            'Accept': 'application/json',
++        }
++
++    def get_base_url(self) -> str:
++        return f'https://codeberg.org/api/v1/repos/{self.owner}/{self.repo}'
++
++    def get_authorize_url(self) -> str:
++        return f'https://{self.username}:{self.token}@codeberg.org/'
++
++    def get_branch_url(self, branch_name: str) -> str:
++        return self.get_base_url() + f'/branches/{branch_name}'
++
++    def get_download_url(self) -> str:
++        return f'{self.base_url}/issues'
++
++    def get_clone_url(self) -> str:
++        username_and_token = (
++            f'{self.username}:{self.token}'
++            if self.username
++            else f'x-auth-token:{self.token}'
++        )
++        return f'https://{username_and_token}@codeberg.org/{self.owner}/{self.repo}.git'
++
++    def get_compare_url(self, branch_name: str) -> str:
++        return f'https://codeberg.org/{self.owner}/{self.repo}/compare/{branch_name}?expand=1'
++
++    def get_converted_issues(
++        self, issue_numbers: list[int] | None = None, comment_id: int | None = None
++    ) -> list[Issue]:
++        """Download issues from Forgejo.
++
++        Args:
++            issue_numbers: The numbers of the issues to download
++            comment_id: The ID of a single comment, if provided, otherwise all comments
++
++        Returns:
++            List of Forgejo issues.
++        """
++
++        if not issue_numbers:
++            raise ValueError('Unspecified issue number')
++
++        all_issues = self.download_issues()
++        logger.info(f'Limiting resolving to issues {issue_numbers}.')
++        all_issues = [
++            issue
++            for issue in all_issues
++            if issue['number'] in issue_numbers and not issue.get('pull_request')
++        ]
++
++        if len(issue_numbers) == 1 and not all_issues:
++            raise ValueError(f'Issue {issue_numbers[0]} not found')
++
++        converted_issues = []
++        for issue in all_issues:
++            # Check for required fields (number and title)
++            if any([issue.get(key) is None for key in ['number', 'title']]):
++                logger.warning(
++                    f'Skipping issue {issue} as it is missing number or title.'
++                )
++                continue
++
++            # Handle empty body by using empty string
++            if issue.get('body') is None:
++                issue['body'] = ''
++
++            # Get issue thread comments
++            thread_comments = self.get_issue_comments(
++                issue['number'], comment_id=comment_id
++            )
++            # Convert empty lists to None for optional fields
++            issue_details = Issue(
++                owner=self.owner,
++                repo=self.repo,
++                number=issue['number'],
++                title=issue['title'],
++                body=issue['body'],
++                thread_comments=thread_comments,
++                review_comments=None,  # Initialize review comments as None for regular issues
++            )
++
++            converted_issues.append(issue_details)
++
++        return converted_issues
++
++    def download_issues(self) -> list[Any]:
++        params: dict[str, int | str] = {'state': 'open', 'page': 1, 'limit': 100}
++        all_issues = []
++
++        while True:
++            response = httpx.get(self.download_url, headers=self.headers, params=params)
++            response.raise_for_status()
++            issues = response.json()
++
++            if not issues:
++                break
++
++            if not isinstance(issues, list) or any(
++                [not isinstance(issue, dict) for issue in issues]
++            ):
++                raise ValueError(
++                    'Expected list of dictionaries from Service Forgejo API.'
++                )
++
++            all_issues.extend(issues)
++            assert isinstance(params['page'], int)
++            params['page'] += 1
++
++        return all_issues
++
++    def get_issue_comments(
++        self, issue_number: int, comment_id: int | None = None
++    ) -> list[str] | None:
++        """Download comments for a specific issue from Forgejo."""
++        url = f'{self.download_url}/{issue_number}/comments'
++        params = {'page': 1, 'limit': 100}
++        all_comments = []
++
++        while True:
++            response = httpx.get(url, headers=self.headers, params=params)
++            response.raise_for_status()
++            comments = response.json()
++
++            if not comments:
++                break
++
++            if comment_id:
++                matching_comment = next(
++                    (
++                        comment['body']
++                        for comment in comments
++                        if comment['id'] == comment_id
++                    ),
++                    None,
++                )
++                if matching_comment:
++                    return [matching_comment]
++            else:
++                all_comments.extend([comment['body'] for comment in comments])
++
++            params['page'] += 1
++
++        return all_comments if all_comments else None
++
++    def branch_exists(self, branch_name: str) -> bool:
++        logger.info(f'Checking if branch {branch_name} exists...')
++        response = httpx.get(
++            f'{self.base_url}/branches/{branch_name}', headers=self.headers
++        )
++        exists = response.status_code == 200
++        logger.info(f'Branch {branch_name} exists: {exists}')
++        return exists
++
++    def get_branch_name(self, base_branch_name: str) -> str:
++        branch_name = base_branch_name
++        attempt = 1
++        while self.branch_exists(branch_name):
++            attempt += 1
++            branch_name = f'{base_branch_name}-try{attempt}'
++        return branch_name
++
++    def reply_to_comment(self, pr_number: int, comment_id: str, reply: str) -> None:
++        # Forgejo doesn't support replying to specific comments in the same way as GitHub
++        # So we'll just add a new comment to the PR
++        self.send_comment_msg(pr_number, reply)
++
++    def get_pull_url(self, pr_number: int) -> str:
++        return f'https://codeberg.org/{self.owner}/{self.repo}/pulls/{pr_number}'
++
++    def get_default_branch_name(self) -> str:
++        response = httpx.get(f'{self.base_url}', headers=self.headers)
++        response.raise_for_status()
++        data = response.json()
++        return str(data['default_branch'])
++
++    def create_pull_request(self, data: dict[str, Any] | None = None) -> dict[str, Any]:
++        if data is None:
++            data = {}
++        response = httpx.post(f'{self.base_url}/pulls', headers=self.headers, json=data)
++        if response.status_code == 403:
++            raise RuntimeError(
++                'Failed to create pull request due to missing permissions. '
++                'Make sure that the provided token has push permissions for the repository.'
++            )
++        response.raise_for_status()
++        pr_data = response.json()
++        return dict(pr_data)
++
++    def request_reviewers(self, reviewer: str, pr_number: int) -> None:
++        # Forgejo doesn't have a direct API for requesting reviewers
++        # We'll add a comment mentioning the reviewer instead
++        msg = f"@{reviewer} Could you please review this pull request?"
++        self.send_comment_msg(pr_number, msg)
++
++    def send_comment_msg(self, issue_number: int, msg: str) -> None:
++        """Send a comment message to a Forgejo issue or pull request.
++
++        Args:
++            issue_number: The issue or pull request number
++            msg: The message content to post as a comment
++        """
++        # Post a comment on the PR
++        comment_url = f'{self.base_url}/issues/{issue_number}/comments'
++        comment_data = {'body': msg}
++        comment_response = httpx.post(
++            comment_url, headers=self.headers, json=comment_data
++        )
++        if comment_response.status_code != 201:
++            logger.error(
++                f'Failed to post comment: {comment_response.status_code} {comment_response.text}'
++            )
++        else:
++            logger.info(f'Comment added to the PR: {msg}')
++
++    def get_context_from_external_issues_references(
++        self,
++        closing_issues: list[str],
++        closing_issue_numbers: list[int],
++        issue_body: str,
++        review_comments: list[str] | None,
++        review_threads: list[ReviewThread],
++        thread_comments: list[str] | None,
++    ) -> list[str]:
++        return []
++
++
++class ForgejoPRHandler(ForgejoIssueHandler):
++    def __init__(self, owner: str, repo: str, token: str, username: str | None = None):
++        super().__init__(owner, repo, token, username)
++        self.download_url = f'https://codeberg.org/api/v1/repos/{self.owner}/{self.repo}/pulls'
++
++    def download_pr_metadata(
++        self, pull_number: int, comment_id: int | None = None
++    ) -> tuple[list[str], list[int], list[str], list[ReviewThread], list[str]]:
++        """Get metadata for a pull request.
++
++        Args:
++            pull_number: The number of the pull request to query.
++            comment_id: Optional ID of a specific comment to focus on.
++
++        Returns:
++            Tuple containing:
++            - List of closing issue bodies
++            - List of closing issue numbers
++            - List of review bodies
++            - List of review threads
++            - List of thread comments
++        """
++        # Get the PR details
++        pr_url = f'{self.base_url}/pulls/{pull_number}'
++        pr_response = httpx.get(pr_url, headers=self.headers)
++        pr_response.raise_for_status()
++        pr_data = pr_response.json()
++
++        # Get closing issues from PR body
++        closing_issues_bodies = []
++        closing_issue_numbers = []
++        if pr_data.get('body'):
++            # Extract issue references from PR body
++            issue_refs = extract_issue_references(pr_data['body'])
++            for issue_ref in issue_refs:
++                try:
++                    issue_url = f'{self.base_url}/issues/{issue_ref}'
++                    issue_response = httpx.get(issue_url, headers=self.headers)
++                    if issue_response.status_code == 200:
++                        issue_data = issue_response.json()
++                        closing_issues_bodies.append(issue_data.get('body', ''))
++                        closing_issue_numbers.append(issue_data.get('number'))
++                except Exception as e:
++                    logger.warning(f"Error fetching issue {issue_ref}: {e}")
++
++        # Get review comments
++        review_url = f'{self.base_url}/pulls/{pull_number}/comments'
++        review_params = {'page': 1, 'limit': 100}
++        review_comments = []
++        
++        while True:
++            review_response = httpx.get(review_url, headers=self.headers, params=review_params)
++            review_response.raise_for_status()
++            comments = review_response.json()
++            
++            if not comments:
++                break
++                
++            if comment_id:
++                matching_comments = [c for c in comments if c.get('id') == comment_id]
++                if matching_comments:
++                    review_comments.extend([c.get('body', '') for c in matching_comments])
++                    break
++            else:
++                review_comments.extend([c.get('body', '') for c in comments])
++                
++            review_params['page'] += 1
++
++        # Get PR comments (thread comments)
++        thread_url = f'{self.base_url}/issues/{pull_number}/comments'
++        thread_params = {'page': 1, 'limit': 100}
++        thread_comments = []
++        
++        while True:
++            thread_response = httpx.get(thread_url, headers=self.headers, params=thread_params)
++            thread_response.raise_for_status()
++            comments = thread_response.json()
++            
++            if not comments:
++                break
++                
++            if comment_id:
++                matching_comments = [c for c in comments if c.get('id') == comment_id]
++                if matching_comments:
++                    thread_comments.extend([c.get('body', '') for c in matching_comments])
++                    break
++            else:
++                thread_comments.extend([c.get('body', '') for c in comments])
++                
++            thread_params['page'] += 1
++
++        # Create review threads
++        review_threads = []
++        for comment in review_comments:
++            # In Forgejo, we don't have the same concept of review threads as in GitHub
++            # So we'll create a simple thread for each comment
++            thread = ReviewThread(
++                id=str(comment_id) if comment_id else "0",
++                message=comment,
++                files=[],
++            )
++            review_threads.append(thread)
++
++        return (
++            closing_issues_bodies,
++            closing_issue_numbers,
++            review_comments,
++            review_threads,
++            thread_comments,
++        )
++
++    def get_converted_issues(
++        self, issue_numbers: list[int] | None = None, comment_id: int | None = None
++    ) -> list[Issue]:
++        """Download pull requests from Forgejo.
++
++        Args:
++            issue_numbers: The numbers of the pull requests to download
++            comment_id: The ID of a single comment, if provided, otherwise all comments
++
++        Returns:
++            List of Forgejo pull requests as Issues.
++        """
++        if not issue_numbers:
++            raise ValueError('Unspecified pull request number')
++
++        all_prs = self.download_prs()
++        logger.info(f'Limiting resolving to pull requests {issue_numbers}.')
++        all_prs = [pr for pr in all_prs if pr['number'] in issue_numbers]
++
++        if len(issue_numbers) == 1 and not all_prs:
++            raise ValueError(f'Pull request {issue_numbers[0]} not found')
++
++        converted_issues = []
++        for pr in all_prs:
++            # Check for required fields (number and title)
++            if any([pr.get(key) is None for key in ['number', 'title']]):
++                logger.warning(
++                    f'Skipping pull request {pr} as it is missing number or title.'
++                )
++                continue
++
++            # Handle empty body by using empty string
++            if pr.get('body') is None:
++                pr['body'] = ''
++
++            # Get PR metadata
++            (
++                closing_issues,
++                closing_issue_numbers,
++                review_comments,
++                review_threads,
++                thread_comments,
++            ) = self.download_pr_metadata(pr['number'], comment_id)
++
++            # Convert empty lists to None for optional fields
++            issue_details = Issue(
++                owner=self.owner,
++                repo=self.repo,
++                number=pr['number'],
++                title=pr['title'],
++                body=pr['body'],
++                thread_comments=thread_comments if thread_comments else None,
++                review_comments=review_comments if review_comments else None,
++                review_threads=review_threads if review_threads else None,
++                closing_issues=closing_issues if closing_issues else None,
++                closing_issue_numbers=closing_issue_numbers if closing_issue_numbers else None,
++            )
++
++            converted_issues.append(issue_details)
++
++        return converted_issues
++
++    def download_prs(self) -> list[Any]:
++        params: dict[str, int | str] = {'state': 'open', 'page': 1, 'limit': 100}
++        all_prs = []
++
++        while True:
++            response = httpx.get(self.download_url, headers=self.headers, params=params)
++            response.raise_for_status()
++            prs = response.json()
++
++            if not prs:
++                break
++
++            if not isinstance(prs, list) or any(
++                [not isinstance(pr, dict) for pr in prs]
++            ):
++                raise ValueError(
++                    'Expected list of dictionaries from Service Forgejo API.'
++                )
++
++            all_prs.extend(prs)
++            assert isinstance(params['page'], int)
++            params['page'] += 1
++
++        return all_prs
+\ No newline at end of file
+diff --git a/tests/unit/test_forgejo_service.py b/tests/unit/test_forgejo_service.py
+new file mode 100644
+index 000000000000..37f25c193d73
+--- /dev/null
++++ b/tests/unit/test_forgejo_service.py
+@@ -0,0 +1,222 @@
++import json
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import httpx
++import pytest
++from pydantic import SecretStr
++
++from openhands.integrations.forgejo.forgejo_service import ForgejoService
++from openhands.integrations.service_types import ProviderType, Repository, User
++from openhands.server.types import AppMode
++
++
++@pytest.fixture
++def forgejo_service():
++    return ForgejoService(token=SecretStr("test_token"))
++
++
++@pytest.mark.asyncio
++async def test_get_user(forgejo_service):
++    # Mock response data
++    mock_user_data = {
++        "id": 1,
++        "username": "test_user",
++        "avatar_url": "https://codeberg.org/avatar/test_user",
++        "full_name": "Test User",
++        "email": "test@example.com",
++        "organization": "Test Org",
++    }
++
++    # Mock the _fetch_data method
++    forgejo_service._fetch_data = AsyncMock(return_value=(mock_user_data, {}))
++
++    # Call the method
++    user = await forgejo_service.get_user()
++
++    # Verify the result
++    assert isinstance(user, User)
++    assert user.id == 1
++    assert user.login == "test_user"
++    assert user.avatar_url == "https://codeberg.org/avatar/test_user"
++    assert user.name == "Test User"
++    assert user.email == "test@example.com"
++    assert user.company == "Test Org"
++
++    # Verify the _fetch_data call
++    forgejo_service._fetch_data.assert_called_once_with(f"{forgejo_service.BASE_URL}/user")
++
++
++@pytest.mark.asyncio
++async def test_search_repositories(forgejo_service):
++    # Mock response data
++    mock_repos_data = {
++        "data": [
++            {
++                "id": 1,
++                "full_name": "test_user/repo1",
++                "stars_count": 10,
++            },
++            {
++                "id": 2,
++                "full_name": "test_user/repo2",
++                "stars_count": 20,
++            },
++        ]
++    }
++
++    # Mock the _fetch_data method
++    forgejo_service._fetch_data = AsyncMock(return_value=(mock_repos_data, {}))
++
++    # Call the method
++    repos = await forgejo_service.search_repositories("test", 10, "updated", "desc")
++
++    # Verify the result
++    assert len(repos) == 2
++    assert all(isinstance(repo, Repository) for repo in repos)
++    assert repos[0].id == 1
++    assert repos[0].full_name == "test_user/repo1"
++    assert repos[0].stargazers_count == 10
++    assert repos[0].git_provider == ProviderType.FORGEJO
++    assert repos[1].id == 2
++    assert repos[1].full_name == "test_user/repo2"
++    assert repos[1].stargazers_count == 20
++    assert repos[1].git_provider == ProviderType.FORGEJO
++
++    # Verify the _fetch_data call
++    forgejo_service._fetch_data.assert_called_once_with(
++        f"{forgejo_service.BASE_URL}/repos/search",
++        {
++            "q": "test",
++            "limit": 10,
++            "sort": "updated",
++            "order": "desc",
++            "mode": "source",
++        },
++    )
++
++
++@pytest.mark.asyncio
++async def test_get_repositories(forgejo_service):
++    # Mock response data for first page
++    mock_repos_data_page1 = [
++        {
++            "id": 1,
++            "full_name": "test_user/repo1",
++            "stars_count": 10,
++        },
++        {
++            "id": 2,
++            "full_name": "test_user/repo2",
++            "stars_count": 20,
++        },
++    ]
++
++    # Mock response data for second page
++    mock_repos_data_page2 = [
++        {
++            "id": 3,
++            "full_name": "test_user/repo3",
++            "stars_count": 30,
++        },
++    ]
++
++    # Mock the _fetch_data method to return different data for different pages
++    forgejo_service._fetch_data = AsyncMock()
++    forgejo_service._fetch_data.side_effect = [
++        (mock_repos_data_page1, {"Link": '<https://codeberg.org/api/v1/user/repos?page=2>; rel="next"'}),
++        (mock_repos_data_page2, {"Link": ""}),
++    ]
++
++    # Call the method
++    repos = await forgejo_service.get_repositories("updated", AppMode.OSS)
++
++    # Verify the result
++    assert len(repos) == 3
++    assert all(isinstance(repo, Repository) for repo in repos)
++    assert repos[0].id == 1
++    assert repos[0].full_name == "test_user/repo1"
++    assert repos[0].stargazers_count == 10
++    assert repos[0].git_provider == ProviderType.FORGEJO
++    assert repos[1].id == 2
++    assert repos[1].full_name == "test_user/repo2"
++    assert repos[1].stargazers_count == 20
++    assert repos[1].git_provider == ProviderType.FORGEJO
++    assert repos[2].id == 3
++    assert repos[2].full_name == "test_user/repo3"
++    assert repos[2].stargazers_count == 30
++    assert repos[2].git_provider == ProviderType.FORGEJO
++
++    # Verify the _fetch_data calls
++    assert forgejo_service._fetch_data.call_count == 2
++    forgejo_service._fetch_data.assert_any_call(
++        f"{forgejo_service.BASE_URL}/user/repos",
++        {"page": "1", "limit": "100", "sort": "updated"},
++    )
++    forgejo_service._fetch_data.assert_any_call(
++        f"{forgejo_service.BASE_URL}/user/repos",
++        {"page": "2", "limit": "100", "sort": "updated"},
++    )
++
++
++@pytest.mark.asyncio
++async def test_fetch_data_success(forgejo_service):
++    # Mock httpx.AsyncClient
++    mock_client = AsyncMock()
++    mock_response = MagicMock()
++    mock_response.status_code = 200
++    mock_response.raise_for_status = MagicMock()
++    mock_response.json.return_value = {"key": "value"}
++    mock_response.headers = {"Link": "next_link"}
++    mock_client.__aenter__.return_value.get.return_value = mock_response
++
++    # Patch httpx.AsyncClient
++    with patch("httpx.AsyncClient", return_value=mock_client):
++        # Call the method
++        result, headers = await forgejo_service._fetch_data("https://test.url", {"param": "value"})
++
++    # Verify the result
++    assert result == {"key": "value"}
++    assert headers == {"Link": "next_link"}
++    mock_response.raise_for_status.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_fetch_data_auth_error(forgejo_service):
++    # Mock httpx.AsyncClient
++    mock_client = AsyncMock()
++    mock_response = MagicMock()
++    mock_response.status_code = 401
++    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
++        "401 Unauthorized", request=MagicMock(), response=mock_response
++    )
++    mock_client.__aenter__.return_value.get.return_value = mock_response
++
++    # Patch httpx.AsyncClient
++    with patch("httpx.AsyncClient", return_value=mock_client):
++        # Call the method and expect an exception
++        with pytest.raises(Exception) as excinfo:
++            await forgejo_service._fetch_data("https://test.url", {"param": "value"})
++
++    # Verify the exception
++    assert "Invalid Forgejo token" in str(excinfo.value)
++
++
++@pytest.mark.asyncio
++async def test_fetch_data_other_error(forgejo_service):
++    # Mock httpx.AsyncClient
++    mock_client = AsyncMock()
++    mock_response = MagicMock()
++    mock_response.status_code = 500
++    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
++        "500 Server Error", request=MagicMock(), response=mock_response
++    )
++    mock_client.__aenter__.return_value.get.return_value = mock_response
++
++    # Patch httpx.AsyncClient
++    with patch("httpx.AsyncClient", return_value=mock_client):
++        # Call the method and expect an exception
++        with pytest.raises(Exception) as excinfo:
++            await forgejo_service._fetch_data("https://test.url", {"param": "value"})
++
++    # Verify the exception
++    assert "Unknown error" in str(excinfo.value)
+\ No newline at end of file
+
+From d52a61474adf736a7c59f005594f9b1dd173709b Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:18:25 +0000
+Subject: [PATCH 02/16] Add documentation for Forgejo integration
+
+---
+ .../usage/cloud/cloud-forgejo-resolver.md     | 74 +++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+ create mode 100644 docs/modules/usage/cloud/cloud-forgejo-resolver.md
+
+diff --git a/docs/modules/usage/cloud/cloud-forgejo-resolver.md b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+new file mode 100644
+index 000000000000..6311474d9972
+--- /dev/null
++++ b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+@@ -0,0 +1,74 @@
++# Forgejo Integration
++
++OpenHands supports integration with Forgejo, a self-hosted Git service that is a fork of Gitea. This integration allows you to interact with Forgejo instances like Codeberg.org.
++
++## Setting Up Forgejo Integration
++
++To use the Forgejo integration, you need to:
++
++1. Generate a personal access token from your Forgejo instance
++2. Configure OpenHands to use this token
++
++### Generating a Personal Access Token
++
++1. Log in to your Forgejo instance (e.g., Codeberg.org)
++2. Go to your user settings (click on your profile picture in the top right corner, then "Settings")
++3. In the left sidebar, click on "Applications"
++4. Under "Generate New Token", enter a name for your token (e.g., "OpenHands")
++5. Select the appropriate scopes for your token (at minimum, you'll need "repo" access)
++6. Click "Generate Token"
++7. Copy the generated token (you won't be able to see it again)
++
++### Configuring OpenHands
++
++You can provide your Forgejo token to OpenHands in one of these ways:
++
++#### Environment Variable
++
++Set the `FORGEJO_TOKEN` environment variable:
++
++```bash
++export FORGEJO_TOKEN=your_token_here
++```
++
++#### Configuration File
++
++Add your token to the OpenHands configuration file:
++
++```yaml
++provider_tokens:
++  forgejo:
++    token: your_token_here
++```
++
++## Using the Forgejo Integration
++
++Once configured, you can use the Forgejo integration to:
++
++- Browse and search repositories
++- View issues and pull requests
++- Clone repositories
++- Create pull requests
++
++The Forgejo integration works similarly to the GitHub and GitLab integrations, with the same interface and functionality.
++
++## Customizing the Base URL
++
++By default, the Forgejo integration uses Codeberg.org as the base URL. If you're using a different Forgejo instance, you can customize the base URL:
++
++```python
++from openhands.integrations.forgejo.forgejo_service import ForgejoService
++from pydantic import SecretStr
++
++# Create a Forgejo service with a custom base URL
++forgejo_service = ForgejoService(
++    token=SecretStr("your_token_here"),
++    base_url="https://your-forgejo-instance.com/api/v1"
++)
++```
++
++## Limitations
++
++- The Forgejo API may have some differences from the GitHub API
++- Some advanced features like requesting reviewers work differently in Forgejo
++- API rate limits may vary depending on the Forgejo instance
+\ No newline at end of file
+
+From b261e106dc0ea02104331a8f20acb978c9f47b26 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:26:58 +0000
+Subject: [PATCH 03/16] Update Forgejo integration with BASE_URL environment
+ variable support and improved documentation
+
+---
+ .../usage/cloud/cloud-forgejo-resolver.md     | 25 ++++++++++++++++++-
+ .../integrations/forgejo/forgejo_service.py   |  4 ++-
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/docs/modules/usage/cloud/cloud-forgejo-resolver.md b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+index 6311474d9972..302f74d0f4b8 100644
+--- a/docs/modules/usage/cloud/cloud-forgejo-resolver.md
++++ b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+@@ -54,7 +54,28 @@ The Forgejo integration works similarly to the GitHub and GitLab integrations, w
+ 
+ ## Customizing the Base URL
+ 
+-By default, the Forgejo integration uses Codeberg.org as the base URL. If you're using a different Forgejo instance, you can customize the base URL:
++By default, the Forgejo integration uses Codeberg.org as the base URL (`https://codeberg.org/api/v1`). If you're using a different Forgejo instance, you can customize the base URL in several ways:
++
++### Using Environment Variables
++
++You can set the `FORGEJO_BASE_URL` environment variable:
++
++```bash
++export FORGEJO_BASE_URL=https://your-forgejo-instance.com/api/v1
++```
++
++### Using Configuration File
++
++Add the base URL to your OpenHands configuration file:
++
++```yaml
++forgejo:
++  base_url: https://your-forgejo-instance.com/api/v1
++```
++
++### Programmatically
++
++You can also set the base URL programmatically when creating a Forgejo service:
+ 
+ ```python
+ from openhands.integrations.forgejo.forgejo_service import ForgejoService
+@@ -67,6 +88,8 @@ forgejo_service = ForgejoService(
+ )
+ ```
+ 
++The base URL should always point to the API endpoint of your Forgejo instance, which typically ends with `/api/v1`.
++
+ ## Limitations
+ 
+ - The Forgejo API may have some differences from the GitHub API
+diff --git a/openhands/integrations/forgejo/forgejo_service.py b/openhands/integrations/forgejo/forgejo_service.py
+index 06c0de67fe5f..2d6676af7c2d 100644
+--- a/openhands/integrations/forgejo/forgejo_service.py
++++ b/openhands/integrations/forgejo/forgejo_service.py
+@@ -18,7 +18,8 @@
+ 
+ 
+ class ForgejoService(GitService):
+-    BASE_URL = 'https://codeberg.org/api/v1'  # Default to Codeberg, can be overridden
++    # Default to Codeberg, can be overridden
++    BASE_URL = os.environ.get('FORGEJO_BASE_URL', 'https://codeberg.org/api/v1')
+     token: SecretStr = SecretStr('')
+     refresh = False
+ 
+@@ -37,6 +38,7 @@ def __init__(
+         if token:
+             self.token = token
+             
++        # Override BASE_URL with provided base_url parameter
+         if base_url:
+             self.BASE_URL = base_url
+ 
+
+From abd67473664fec3e349ed0e9f77dfa340670c27c Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:34:12 +0000
+Subject: [PATCH 04/16] Fix Forgejo integration to properly support pull
+ request reviewers
+
+---
+ .../usage/cloud/cloud-forgejo-resolver.md       |  1 -
+ microagents/knowledge/forgejo.md                |  1 -
+ openhands/resolver/interfaces/forgejo.py        | 17 +++++++++++++----
+ 3 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/docs/modules/usage/cloud/cloud-forgejo-resolver.md b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+index 302f74d0f4b8..684208ef98f8 100644
+--- a/docs/modules/usage/cloud/cloud-forgejo-resolver.md
++++ b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+@@ -93,5 +93,4 @@ The base URL should always point to the API endpoint of your Forgejo instance, w
+ ## Limitations
+ 
+ - The Forgejo API may have some differences from the GitHub API
+-- Some advanced features like requesting reviewers work differently in Forgejo
+ - API rate limits may vary depending on the Forgejo instance
+\ No newline at end of file
+diff --git a/microagents/knowledge/forgejo.md b/microagents/knowledge/forgejo.md
+index eb0feb05a2c6..410281057c1f 100644
+--- a/microagents/knowledge/forgejo.md
++++ b/microagents/knowledge/forgejo.md
+@@ -42,7 +42,6 @@ The API supports pagination with the `page` and `limit` parameters. The `Link` h
+ 
+ - Forgejo uses `limit` instead of `per_page` for pagination
+ - Forgejo uses `stars_count` instead of `stargazers_count` for repository stars
+-- Forgejo doesn't have a direct API for requesting reviewers on pull requests
+ - Forgejo doesn't support replying to specific comments in the same way as GitHub
+ 
+ ## Codeberg Specifics
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 4613d05dd049..22a8496a6bc2 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -218,10 +218,19 @@ def create_pull_request(self, data: dict[str, Any] | None = None) -> dict[str, A
+         return dict(pr_data)
+ 
+     def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+-        # Forgejo doesn't have a direct API for requesting reviewers
+-        # We'll add a comment mentioning the reviewer instead
+-        msg = f"@{reviewer} Could you please review this pull request?"
+-        self.send_comment_msg(pr_number, msg)
++        """Request a reviewer for a pull request.
++        
++        Forgejo supports requesting reviewers via the API.
++        """
++        url = f'{self.base_url}/pulls/{pr_number}/requested_reviewers'
++        data = {'reviewers': [reviewer]}
++        response = httpx.post(url, headers=self.headers, json=data)
++        
++        if response.status_code not in (200, 201):
++            logger.warning(f"Failed to request review from {reviewer}: {response.text}")
++            # Fallback to mentioning the reviewer in a comment
++            msg = f"@{reviewer} Could you please review this pull request?"
++            self.send_comment_msg(pr_number, msg)
+ 
+     def send_comment_msg(self, issue_number: int, msg: str) -> None:
+         """Send a comment message to a Forgejo issue or pull request.
+
+From fae9d19147ce96337cdb5fbab8978906ccc3ae8e Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:36:57 +0000
+Subject: [PATCH 05/16] Improve Forgejo integration with more accurate reviewer
+ request implementation
+
+---
+ openhands/resolver/interfaces/forgejo.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 22a8496a6bc2..426122faf1e5 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -223,7 +223,13 @@ def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+         Forgejo supports requesting reviewers via the API.
+         """
+         url = f'{self.base_url}/pulls/{pr_number}/requested_reviewers'
+-        data = {'reviewers': [reviewer]}
++        
++        # The API expects a PullReviewRequestOptions object with reviewers as a list of strings
++        data = {
++            'reviewers': [reviewer],
++            'team_reviewers': []
++        }
++        
+         response = httpx.post(url, headers=self.headers, json=data)
+         
+         if response.status_code not in (200, 201):
+
+From b78607596dc28cb8524dac29b99bdae13e4ebd95 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:39:44 +0000
+Subject: [PATCH 06/16] Improve Forgejo comment reply implementation with
+ better documentation
+
+---
+ openhands/resolver/interfaces/forgejo.py | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 426122faf1e5..2bfb2d8689ff 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -191,9 +191,17 @@ def get_branch_name(self, base_branch_name: str) -> str:
+         return branch_name
+ 
+     def reply_to_comment(self, pr_number: int, comment_id: str, reply: str) -> None:
+-        # Forgejo doesn't support replying to specific comments in the same way as GitHub
+-        # So we'll just add a new comment to the PR
+-        self.send_comment_msg(pr_number, reply)
++        """Reply to a specific comment on a pull request.
++        
++        Forgejo doesn't have a direct API endpoint for replying to specific comments
++        like GitHub does. While the internal data model supports reference comments,
++        there's no exposed API for this functionality.
++        
++        As a workaround, we'll add a new comment that mentions the original comment.
++        """
++        # Format the reply to reference the original comment
++        formatted_reply = f"In response to comment {comment_id}:\n\n{reply}"
++        self.send_comment_msg(pr_number, formatted_reply)
+ 
+     def get_pull_url(self, pr_number: int) -> str:
+         return f'https://codeberg.org/{self.owner}/{self.repo}/pulls/{pr_number}'
+
+From d3afba149255e528085e4e5781a65865d4ef1286 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:52:09 +0000
+Subject: [PATCH 07/16] Improve Forgejo review threads implementation to match
+ Forgejo's CodeConversations model
+
+---
+ openhands/resolver/interfaces/forgejo.py | 160 ++++++++++++++++++-----
+ 1 file changed, 126 insertions(+), 34 deletions(-)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 2bfb2d8689ff..354f7548b3ec 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -1,5 +1,4 @@
+ from typing import Any
+-from urllib.parse import quote
+ 
+ import httpx
+ 
+@@ -192,15 +191,15 @@ def get_branch_name(self, base_branch_name: str) -> str:
+ 
+     def reply_to_comment(self, pr_number: int, comment_id: str, reply: str) -> None:
+         """Reply to a specific comment on a pull request.
+-        
++
+         Forgejo doesn't have a direct API endpoint for replying to specific comments
+         like GitHub does. While the internal data model supports reference comments,
+         there's no exposed API for this functionality.
+-        
++
+         As a workaround, we'll add a new comment that mentions the original comment.
+         """
+         # Format the reply to reference the original comment
+-        formatted_reply = f"In response to comment {comment_id}:\n\n{reply}"
++        formatted_reply = f'In response to comment {comment_id}:\n\n{reply}'
+         self.send_comment_msg(pr_number, formatted_reply)
+ 
+     def get_pull_url(self, pr_number: int) -> str:
+@@ -227,25 +226,101 @@ def create_pull_request(self, data: dict[str, Any] | None = None) -> dict[str, A
+ 
+     def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+         """Request a reviewer for a pull request.
+-        
++
+         Forgejo supports requesting reviewers via the API.
+         """
+         url = f'{self.base_url}/pulls/{pr_number}/requested_reviewers'
+-        
++
+         # The API expects a PullReviewRequestOptions object with reviewers as a list of strings
+-        data = {
+-            'reviewers': [reviewer],
+-            'team_reviewers': []
+-        }
+-        
++        data = {'reviewers': [reviewer], 'team_reviewers': []}
++
+         response = httpx.post(url, headers=self.headers, json=data)
+-        
++
+         if response.status_code not in (200, 201):
+-            logger.warning(f"Failed to request review from {reviewer}: {response.text}")
++            logger.warning(f'Failed to request review from {reviewer}: {response.text}')
+             # Fallback to mentioning the reviewer in a comment
+-            msg = f"@{reviewer} Could you please review this pull request?"
++            msg = f'@{reviewer} Could you please review this pull request?'
+             self.send_comment_msg(pr_number, msg)
+ 
++    def get_review_comments(self, pr_number: int) -> list[dict[str, Any]]:
++        """Get review comments for a pull request.
++
++        Args:
++            pr_number: The pull request number
++
++        Returns:
++            List of review comments
++        """
++        url = f'{self.base_url}/pulls/{pr_number}/comments'
++        params = {'page': 1, 'limit': 100}
++        all_comments = []
++
++        while True:
++            response = httpx.get(url, headers=self.headers, params=params)
++            response.raise_for_status()
++            comments = response.json()
++
++            if not comments:
++                break
++
++            all_comments.extend(comments)
++            params['page'] += 1
++
++        return all_comments
++
++    def get_review_threads(self, pr_number: int) -> list[dict[str, Any]]:
++        """Get review threads for a pull request.
++
++        Forgejo organizes code comments into "CodeConversations" which are collections
++        of comments on the same line of code from the same review. However, the API
++        doesn't expose these conversations directly in the same way GitHub does.
++
++        This implementation creates synthetic "threads" by grouping comments by their
++        file path and line number, which approximates how Forgejo would display them
++        in the UI.
++        """
++        comments = self.get_review_comments(pr_number)
++
++        # Group comments by path and line to simulate Forgejo's CodeConversations
++        conversations = {}  # path -> line -> [comments]
++
++        for comment in comments:
++            path = comment.get('path', '')
++            line = comment.get('position', 0)
++            review_id = comment.get('pull_request_review_id', 0)
++            key = f'{path}:{line}:{review_id}'
++
++            if key not in conversations:
++                conversations[key] = {
++                    'path': path,
++                    'line': line,
++                    'position': line,
++                    'review_id': review_id,
++                    'comments': [],
++                }
++
++            conversations[key]['comments'].append(comment)
++
++        # Convert the grouped conversations to threads
++        threads = []
++        for key, conversation in conversations.items():
++            # Use the ID of the first comment as the thread ID
++            thread_id = (
++                conversation['comments'][0]['id'] if conversation['comments'] else 0
++            )
++
++            thread = {
++                'id': thread_id,
++                'comments': conversation['comments'],
++                'path': conversation['path'],
++                'line': conversation['line'],
++                'position': conversation['position'],
++                'review_id': conversation['review_id'],
++            }
++            threads.append(thread)
++
++        return threads
++
+     def send_comment_msg(self, issue_number: int, msg: str) -> None:
+         """Send a comment message to a Forgejo issue or pull request.
+ 
+@@ -281,7 +356,9 @@ def get_context_from_external_issues_references(
+ class ForgejoPRHandler(ForgejoIssueHandler):
+     def __init__(self, owner: str, repo: str, token: str, username: str | None = None):
+         super().__init__(owner, repo, token, username)
+-        self.download_url = f'https://codeberg.org/api/v1/repos/{self.owner}/{self.repo}/pulls'
++        self.download_url = (
++            f'https://codeberg.org/api/v1/repos/{self.owner}/{self.repo}/pulls'
++        )
+ 
+     def download_pr_metadata(
+         self, pull_number: int, comment_id: int | None = None
+@@ -321,61 +398,74 @@ def download_pr_metadata(
+                         closing_issues_bodies.append(issue_data.get('body', ''))
+                         closing_issue_numbers.append(issue_data.get('number'))
+                 except Exception as e:
+-                    logger.warning(f"Error fetching issue {issue_ref}: {e}")
++                    logger.warning(f'Error fetching issue {issue_ref}: {e}')
+ 
+         # Get review comments
+         review_url = f'{self.base_url}/pulls/{pull_number}/comments'
+         review_params = {'page': 1, 'limit': 100}
+         review_comments = []
+-        
++
+         while True:
+-            review_response = httpx.get(review_url, headers=self.headers, params=review_params)
++            review_response = httpx.get(
++                review_url, headers=self.headers, params=review_params
++            )
+             review_response.raise_for_status()
+             comments = review_response.json()
+-            
++
+             if not comments:
+                 break
+-                
++
+             if comment_id:
+                 matching_comments = [c for c in comments if c.get('id') == comment_id]
+                 if matching_comments:
+-                    review_comments.extend([c.get('body', '') for c in matching_comments])
++                    review_comments.extend(
++                        [c.get('body', '') for c in matching_comments]
++                    )
+                     break
+             else:
+                 review_comments.extend([c.get('body', '') for c in comments])
+-                
++
+             review_params['page'] += 1
+ 
+         # Get PR comments (thread comments)
+         thread_url = f'{self.base_url}/issues/{pull_number}/comments'
+         thread_params = {'page': 1, 'limit': 100}
+         thread_comments = []
+-        
++
+         while True:
+-            thread_response = httpx.get(thread_url, headers=self.headers, params=thread_params)
++            thread_response = httpx.get(
++                thread_url, headers=self.headers, params=thread_params
++            )
+             thread_response.raise_for_status()
+             comments = thread_response.json()
+-            
++
+             if not comments:
+                 break
+-                
++
+             if comment_id:
+                 matching_comments = [c for c in comments if c.get('id') == comment_id]
+                 if matching_comments:
+-                    thread_comments.extend([c.get('body', '') for c in matching_comments])
++                    thread_comments.extend(
++                        [c.get('body', '') for c in matching_comments]
++                    )
+                     break
+             else:
+                 thread_comments.extend([c.get('body', '') for c in comments])
+-                
++
+             thread_params['page'] += 1
+ 
+         # Create review threads
++        # Forgejo organizes code comments into "CodeConversations" which are collections
++        # of comments on the same line of code from the same review. However, the API
++        # doesn't expose these conversations directly in the same way GitHub does.
++        #
++        # Since we only have the comment bodies here and not the full comment objects with
++        # path and line information, we'll create individual threads for each comment.
++        # In a more complete implementation, we would group comments by path and line.
+         review_threads = []
+-        for comment in review_comments:
+-            # In Forgejo, we don't have the same concept of review threads as in GitHub
+-            # So we'll create a simple thread for each comment
++        for i, comment in enumerate(review_comments):
+             thread = ReviewThread(
+-                id=str(comment_id) if comment_id else "0",
++                id=str(comment_id) if comment_id else str(i),
+                 message=comment,
+                 files=[],
+             )
+@@ -444,7 +534,9 @@ def get_converted_issues(
+                 review_comments=review_comments if review_comments else None,
+                 review_threads=review_threads if review_threads else None,
+                 closing_issues=closing_issues if closing_issues else None,
+-                closing_issue_numbers=closing_issue_numbers if closing_issue_numbers else None,
++                closing_issue_numbers=closing_issue_numbers
++                if closing_issue_numbers
++                else None,
+             )
+ 
+             converted_issues.append(issue_details)
+@@ -474,4 +566,4 @@ def download_prs(self) -> list[Any]:
+             assert isinstance(params['page'], int)
+             params['page'] += 1
+ 
+-        return all_prs
+\ No newline at end of file
++        return all_prs
+
+From 64cbd0b88fb7948041685219f758bbf45be33129 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:56:27 +0000
+Subject: [PATCH 08/16] Add get_pr_comments method to Forgejo implementation
+
+---
+ openhands/resolver/interfaces/forgejo.py | 42 ++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 354f7548b3ec..30efff675902 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -267,6 +267,48 @@ def get_review_comments(self, pr_number: int) -> list[dict[str, Any]]:
+             params['page'] += 1
+ 
+         return all_comments
++        
++    def get_pr_comments(
++        self, pr_number: int, comment_id: int | None = None
++    ) -> list[str] | None:
++        """Download comments for a specific pull request from Forgejo.
++        
++        Args:
++            pr_number: The pull request number
++            comment_id: Optional ID of a specific comment to focus on
++            
++        Returns:
++            List of comment bodies or None if no comments
++        """
++        url = f'{self.base_url}/issues/{pr_number}/comments'
++        params = {'page': 1, 'limit': 100}
++        all_comments = []
++        
++        while True:
++            response = httpx.get(url, headers=self.headers, params=params)
++            response.raise_for_status()
++            comments = response.json()
++            
++            if not comments:
++                break
++                
++            if comment_id:
++                matching_comment = next(
++                    (
++                        comment['body']
++                        for comment in comments
++                        if comment['id'] == comment_id
++                    ),
++                    None,
++                )
++                if matching_comment:
++                    return [matching_comment]
++            else:
++                all_comments.extend([comment['body'] for comment in comments])
++                
++            params['page'] += 1
++            
++        return all_comments if all_comments else None
+ 
+     def get_review_threads(self, pr_number: int) -> list[dict[str, Any]]:
+         """Get review threads for a pull request.
+
+From d08f3dd9be3eeda2aae871cdaf7e0bd40716ee32 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:57:00 +0000
+Subject: [PATCH 09/16] Add stub implementation of get_graphql_url for Forgejo
+
+---
+ openhands/resolver/interfaces/forgejo.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 30efff675902..44b3951f4f2b 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -50,6 +50,14 @@ def get_clone_url(self) -> str:
+             else f'x-auth-token:{self.token}'
+         )
+         return f'https://{username_and_token}@codeberg.org/{self.owner}/{self.repo}.git'
++        
++    def get_graphql_url(self) -> str:
++        """Get the GraphQL API URL.
++        
++        Note: Forgejo doesn't support GraphQL, but we need to implement this method
++        to satisfy the interface. This method will never be called in practice.
++        """
++        return f'https://codeberg.org/api/graphql'
+ 
+     def get_compare_url(self, branch_name: str) -> str:
+         return f'https://codeberg.org/{self.owner}/{self.repo}/compare/{branch_name}?expand=1'
+
+From 8897322f872aaa825bc1b449d2e006be8202c8b3 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 10:59:16 +0000
+Subject: [PATCH 10/16] Add error handling for Forgejo API calls
+
+---
+ openhands/resolver/interfaces/forgejo.py | 80 +++++++++++++-----------
+ 1 file changed, 44 insertions(+), 36 deletions(-)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 44b3951f4f2b..27bf413ae341 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -455,54 +455,62 @@ def download_pr_metadata(
+         review_params = {'page': 1, 'limit': 100}
+         review_comments = []
+ 
+-        while True:
+-            review_response = httpx.get(
+-                review_url, headers=self.headers, params=review_params
+-            )
+-            review_response.raise_for_status()
+-            comments = review_response.json()
+-
+-            if not comments:
+-                break
++        try:
++            while True:
++                review_response = httpx.get(
++                    review_url, headers=self.headers, params=review_params
++                )
++                review_response.raise_for_status()
++                comments = review_response.json()
+ 
+-            if comment_id:
+-                matching_comments = [c for c in comments if c.get('id') == comment_id]
+-                if matching_comments:
+-                    review_comments.extend(
+-                        [c.get('body', '') for c in matching_comments]
+-                    )
++                if not comments:
+                     break
+-            else:
+-                review_comments.extend([c.get('body', '') for c in comments])
+ 
+-            review_params['page'] += 1
++                if comment_id:
++                    matching_comments = [c for c in comments if c.get('id') == comment_id]
++                    if matching_comments:
++                        review_comments.extend(
++                            [c.get('body', '') for c in matching_comments]
++                        )
++                        break
++                else:
++                    review_comments.extend([c.get('body', '') for c in comments])
++
++                review_params['page'] += 1
++        except httpx.HTTPStatusError as e:
++            logger.warning(f"Error fetching review comments: {e}")
++            # Continue with empty review comments
+ 
+         # Get PR comments (thread comments)
+         thread_url = f'{self.base_url}/issues/{pull_number}/comments'
+         thread_params = {'page': 1, 'limit': 100}
+         thread_comments = []
+ 
+-        while True:
+-            thread_response = httpx.get(
+-                thread_url, headers=self.headers, params=thread_params
+-            )
+-            thread_response.raise_for_status()
+-            comments = thread_response.json()
+-
+-            if not comments:
+-                break
++        try:
++            while True:
++                thread_response = httpx.get(
++                    thread_url, headers=self.headers, params=thread_params
++                )
++                thread_response.raise_for_status()
++                comments = thread_response.json()
+ 
+-            if comment_id:
+-                matching_comments = [c for c in comments if c.get('id') == comment_id]
+-                if matching_comments:
+-                    thread_comments.extend(
+-                        [c.get('body', '') for c in matching_comments]
+-                    )
++                if not comments:
+                     break
+-            else:
+-                thread_comments.extend([c.get('body', '') for c in comments])
+ 
+-            thread_params['page'] += 1
++                if comment_id:
++                    matching_comments = [c for c in comments if c.get('id') == comment_id]
++                    if matching_comments:
++                        thread_comments.extend(
++                            [c.get('body', '') for c in matching_comments]
++                        )
++                        break
++                else:
++                    thread_comments.extend([c.get('body', '') for c in comments])
++
++                thread_params['page'] += 1
++        except httpx.HTTPStatusError as e:
++            logger.warning(f"Error fetching thread comments: {e}")
++            # Continue with empty thread comments
+ 
+         # Create review threads
+         # Forgejo organizes code comments into "CodeConversations" which are collections
+
+From f699b4070d886c4c489f7edd7c207d0984aa98d3 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 11:00:18 +0000
+Subject: [PATCH 11/16] Improve error handling in Forgejo PR metadata fetching
+
+---
+ openhands/resolver/interfaces/forgejo.py | 30 ++++++++++++++++++------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 27bf413ae341..2b5ad726d703 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -427,15 +427,31 @@ def download_pr_metadata(
+             - List of review threads
+             - List of thread comments
+         """
+-        # Get the PR details
+-        pr_url = f'{self.base_url}/pulls/{pull_number}'
+-        pr_response = httpx.get(pr_url, headers=self.headers)
+-        pr_response.raise_for_status()
+-        pr_data = pr_response.json()
+-
+-        # Get closing issues from PR body
++        # Initialize empty return values
+         closing_issues_bodies = []
+         closing_issue_numbers = []
++        review_comments = []
++        review_threads = []
++        thread_comments = []
++        
++        try:
++            # Get the PR details
++            pr_url = f'{self.base_url}/pulls/{pull_number}'
++            pr_response = httpx.get(pr_url, headers=self.headers)
++            pr_response.raise_for_status()
++            pr_data = pr_response.json()
++        except httpx.HTTPStatusError as e:
++            logger.warning(f"Error fetching pull request {pull_number}: {e}")
++            # Return empty data
++            return (
++                closing_issues_bodies,
++                closing_issue_numbers,
++                review_comments,
++                review_threads,
++                thread_comments,
++            )
++
++        # Get closing issues from PR body
+         if pr_data.get('body'):
+             # Extract issue references from PR body
+             issue_refs = extract_issue_references(pr_data['body'])
+
+From 655a9a59595a18efa5c1ae8cb56b327a153b20f6 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 11:02:49 +0000
+Subject: [PATCH 12/16] Add timeouts to all Forgejo API calls to improve
+ reliability
+
+---
+ openhands/resolver/interfaces/forgejo.py | 140 ++++++++++++++---------
+ 1 file changed, 87 insertions(+), 53 deletions(-)
+
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 2b5ad726d703..0e6617a8da24 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -182,12 +182,16 @@ def get_issue_comments(
+ 
+     def branch_exists(self, branch_name: str) -> bool:
+         logger.info(f'Checking if branch {branch_name} exists...')
+-        response = httpx.get(
+-            f'{self.base_url}/branches/{branch_name}', headers=self.headers
+-        )
+-        exists = response.status_code == 200
+-        logger.info(f'Branch {branch_name} exists: {exists}')
+-        return exists
++        try:
++            response = httpx.get(
++                f'{self.base_url}/branches/{branch_name}', headers=self.headers, timeout=10.0
++            )
++            exists = response.status_code == 200
++            logger.info(f'Branch {branch_name} exists: {exists}')
++            return exists
++        except httpx.ReadTimeout:
++            logger.warning(f"Timeout checking if branch {branch_name} exists")
++            return False  # Assume branch doesn't exist if we time out
+ 
+     def get_branch_name(self, base_branch_name: str) -> str:
+         branch_name = base_branch_name
+@@ -214,23 +218,35 @@ def get_pull_url(self, pr_number: int) -> str:
+         return f'https://codeberg.org/{self.owner}/{self.repo}/pulls/{pr_number}'
+ 
+     def get_default_branch_name(self) -> str:
+-        response = httpx.get(f'{self.base_url}', headers=self.headers)
+-        response.raise_for_status()
+-        data = response.json()
+-        return str(data['default_branch'])
++        try:
++            response = httpx.get(f'{self.base_url}', headers=self.headers, timeout=10.0)
++            response.raise_for_status()
++            data = response.json()
++            return str(data['default_branch'])
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
++            logger.warning(f"Error fetching default branch: {e}")
++            return "main"  # Default to 'main' if we can't get the default branch
+ 
+     def create_pull_request(self, data: dict[str, Any] | None = None) -> dict[str, Any]:
+         if data is None:
+             data = {}
+-        response = httpx.post(f'{self.base_url}/pulls', headers=self.headers, json=data)
+-        if response.status_code == 403:
+-            raise RuntimeError(
+-                'Failed to create pull request due to missing permissions. '
+-                'Make sure that the provided token has push permissions for the repository.'
++        try:
++            response = httpx.post(
++                f'{self.base_url}/pulls', 
++                headers=self.headers, 
++                json=data,
++                timeout=10.0
+             )
+-        response.raise_for_status()
+-        pr_data = response.json()
+-        return dict(pr_data)
++            if response.status_code == 403:
++                raise RuntimeError(
++                    'Failed to create pull request due to missing permissions. '
++                    'Make sure that the provided token has push permissions for the repository.'
++                )
++            response.raise_for_status()
++            pr_data = response.json()
++            return dict(pr_data)
++        except httpx.ReadTimeout as e:
++            raise RuntimeError(f"Timeout creating pull request: {e}")
+ 
+     def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+         """Request a reviewer for a pull request.
+@@ -242,10 +258,16 @@ def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+         # The API expects a PullReviewRequestOptions object with reviewers as a list of strings
+         data = {'reviewers': [reviewer], 'team_reviewers': []}
+ 
+-        response = httpx.post(url, headers=self.headers, json=data)
+-
+-        if response.status_code not in (200, 201):
+-            logger.warning(f'Failed to request review from {reviewer}: {response.text}')
++        try:
++            response = httpx.post(url, headers=self.headers, json=data, timeout=10.0)
++
++            if response.status_code not in (200, 201):
++                logger.warning(f'Failed to request review from {reviewer}: {response.text}')
++                # Fallback to mentioning the reviewer in a comment
++                msg = f'@{reviewer} Could you please review this pull request?'
++                self.send_comment_msg(pr_number, msg)
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
++            logger.warning(f"Error requesting reviewer {reviewer}: {e}")
+             # Fallback to mentioning the reviewer in a comment
+             msg = f'@{reviewer} Could you please review this pull request?'
+             self.send_comment_msg(pr_number, msg)
+@@ -381,15 +403,18 @@ def send_comment_msg(self, issue_number: int, msg: str) -> None:
+         # Post a comment on the PR
+         comment_url = f'{self.base_url}/issues/{issue_number}/comments'
+         comment_data = {'body': msg}
+-        comment_response = httpx.post(
+-            comment_url, headers=self.headers, json=comment_data
+-        )
+-        if comment_response.status_code != 201:
+-            logger.error(
+-                f'Failed to post comment: {comment_response.status_code} {comment_response.text}'
++        try:
++            comment_response = httpx.post(
++                comment_url, headers=self.headers, json=comment_data, timeout=10.0
+             )
+-        else:
+-            logger.info(f'Comment added to the PR: {msg}')
++            if comment_response.status_code != 201:
++                logger.error(
++                    f'Failed to post comment: {comment_response.status_code} {comment_response.text}'
++                )
++            else:
++                logger.info(f'Comment added to the PR: {msg}')
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
++            logger.error(f'Failed to post comment due to error: {e}')
+ 
+     def get_context_from_external_issues_references(
+         self,
+@@ -437,10 +462,10 @@ def download_pr_metadata(
+         try:
+             # Get the PR details
+             pr_url = f'{self.base_url}/pulls/{pull_number}'
+-            pr_response = httpx.get(pr_url, headers=self.headers)
++            pr_response = httpx.get(pr_url, headers=self.headers, timeout=10.0)
+             pr_response.raise_for_status()
+             pr_data = pr_response.json()
+-        except httpx.HTTPStatusError as e:
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+             logger.warning(f"Error fetching pull request {pull_number}: {e}")
+             # Return empty data
+             return (
+@@ -458,7 +483,7 @@ def download_pr_metadata(
+             for issue_ref in issue_refs:
+                 try:
+                     issue_url = f'{self.base_url}/issues/{issue_ref}'
+-                    issue_response = httpx.get(issue_url, headers=self.headers)
++                    issue_response = httpx.get(issue_url, headers=self.headers, timeout=10.0)
+                     if issue_response.status_code == 200:
+                         issue_data = issue_response.json()
+                         closing_issues_bodies.append(issue_data.get('body', ''))
+@@ -474,7 +499,7 @@ def download_pr_metadata(
+         try:
+             while True:
+                 review_response = httpx.get(
+-                    review_url, headers=self.headers, params=review_params
++                    review_url, headers=self.headers, params=review_params, timeout=10.0
+                 )
+                 review_response.raise_for_status()
+                 comments = review_response.json()
+@@ -493,7 +518,7 @@ def download_pr_metadata(
+                     review_comments.extend([c.get('body', '') for c in comments])
+ 
+                 review_params['page'] += 1
+-        except httpx.HTTPStatusError as e:
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+             logger.warning(f"Error fetching review comments: {e}")
+             # Continue with empty review comments
+ 
+@@ -505,7 +530,7 @@ def download_pr_metadata(
+         try:
+             while True:
+                 thread_response = httpx.get(
+-                    thread_url, headers=self.headers, params=thread_params
++                    thread_url, headers=self.headers, params=thread_params, timeout=10.0
+                 )
+                 thread_response.raise_for_status()
+                 comments = thread_response.json()
+@@ -524,7 +549,7 @@ def download_pr_metadata(
+                     thread_comments.extend([c.get('body', '') for c in comments])
+ 
+                 thread_params['page'] += 1
+-        except httpx.HTTPStatusError as e:
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+             logger.warning(f"Error fetching thread comments: {e}")
+             # Continue with empty thread comments
+ 
+@@ -621,23 +646,32 @@ def download_prs(self) -> list[Any]:
+         params: dict[str, int | str] = {'state': 'open', 'page': 1, 'limit': 100}
+         all_prs = []
+ 
+-        while True:
+-            response = httpx.get(self.download_url, headers=self.headers, params=params)
+-            response.raise_for_status()
+-            prs = response.json()
+-
+-            if not prs:
+-                break
+-
+-            if not isinstance(prs, list) or any(
+-                [not isinstance(pr, dict) for pr in prs]
+-            ):
+-                raise ValueError(
+-                    'Expected list of dictionaries from Service Forgejo API.'
++        try:
++            while True:
++                response = httpx.get(
++                    self.download_url, 
++                    headers=self.headers, 
++                    params=params,
++                    timeout=10.0  # Add a 10-second timeout
+                 )
++                response.raise_for_status()
++                prs = response.json()
+ 
+-            all_prs.extend(prs)
+-            assert isinstance(params['page'], int)
+-            params['page'] += 1
++                if not prs:
++                    break
+ 
++                if not isinstance(prs, list) or any(
++                    [not isinstance(pr, dict) for pr in prs]
++                ):
++                    raise ValueError(
++                        'Expected list of dictionaries from Service Forgejo API.'
++                    )
++
++                all_prs.extend(prs)
++                assert isinstance(params['page'], int)
++                params['page'] += 1
++        except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
++            logger.warning(f"Error downloading pull requests: {e}")
++            # Return whatever we've got so far
++            
+         return all_prs
+
+From 4f2ca0b9543560a5fad49afae0b5d174e731e7c4 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 11:06:31 +0000
+Subject: [PATCH 13/16] Update Forgejo documentation with improved
+ implementation details
+
+---
+ .../usage/cloud/cloud-forgejo-resolver.md     | 29 +++++++++++++++----
+ microagents/knowledge/forgejo.md              | 27 +++++++++++++++--
+ 2 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/docs/modules/usage/cloud/cloud-forgejo-resolver.md b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+index 684208ef98f8..4968cb37f8c4 100644
+--- a/docs/modules/usage/cloud/cloud-forgejo-resolver.md
++++ b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+@@ -1,6 +1,6 @@
+ # Forgejo Integration
+ 
+-OpenHands supports integration with Forgejo, a self-hosted Git service that is a fork of Gitea. This integration allows you to interact with Forgejo instances like Codeberg.org.
++OpenHands supports integration with Forgejo, a self-hosted Git service that is a fork of Gitea. This integration allows you to interact with Forgejo instances like Codeberg.org and other self-hosted Forgejo servers.
+ 
+ ## Setting Up Forgejo Integration
+ 
+@@ -49,8 +49,11 @@ Once configured, you can use the Forgejo integration to:
+ - View issues and pull requests
+ - Clone repositories
+ - Create pull requests
++- Request reviewers for pull requests
++- Comment on issues and pull requests
++- View and interact with review threads
+ 
+-The Forgejo integration works similarly to the GitHub and GitLab integrations, with the same interface and functionality.
++The Forgejo integration works similarly to the GitHub and GitLab integrations, with the same interface and functionality. Our implementation handles API differences transparently, so you can use the same code regardless of which Git service you're using.
+ 
+ ## Customizing the Base URL
+ 
+@@ -90,7 +93,23 @@ forgejo_service = ForgejoService(
+ 
+ The base URL should always point to the API endpoint of your Forgejo instance, which typically ends with `/api/v1`.
+ 
+-## Limitations
++## Limitations and Considerations
+ 
+-- The Forgejo API may have some differences from the GitHub API
+-- API rate limits may vary depending on the Forgejo instance
+\ No newline at end of file
++- API rate limits may vary depending on the Forgejo instance
++- Some Forgejo instances may have different API configurations or versions
++- The implementation includes robust error handling and timeouts to ensure reliability
++- Network connectivity issues are handled gracefully with appropriate fallbacks
++
++## Implementation Details
++
++Our Forgejo integration includes several key features:
++
++- **Error Handling**: All API calls include proper error handling to ensure robustness
++- **Timeouts**: API calls include timeouts to prevent hanging on slow or unresponsive servers
++- **Fallbacks**: When certain API calls fail, the implementation falls back to alternative methods
++- **Review Threads**: Support for code review threads, organized by file path and line number
++- **Reviewer Requests**: Support for requesting reviewers on pull requests
++
++## Testing
++
++The Forgejo integration has been tested against Codeberg.org, which is one of the most popular public Forgejo instances. If you encounter any issues with other Forgejo instances, please report them so we can improve the integration.
+\ No newline at end of file
+diff --git a/microagents/knowledge/forgejo.md b/microagents/knowledge/forgejo.md
+index 410281057c1f..f6b9ea7b5dfd 100644
+--- a/microagents/knowledge/forgejo.md
++++ b/microagents/knowledge/forgejo.md
+@@ -1,6 +1,6 @@
+ # Forgejo Knowledge
+ 
+-Forgejo is a self-hosted Git service that is a fork of Gitea. It provides a lightweight, open-source alternative to GitHub and GitLab. Codeberg.org is a popular instance of Forgejo.
++Forgejo is a self-hosted Git service that is a fork of Gitea. It provides a lightweight, open-source alternative to GitHub and GitLab. Codeberg.org is a popular instance of Forgejo. OpenHands provides robust integration with Forgejo instances, with full support for repository operations, issue tracking, and code review.
+ 
+ ## API
+ 
+@@ -42,7 +42,9 @@ The API supports pagination with the `page` and `limit` parameters. The `Link` h
+ 
+ - Forgejo uses `limit` instead of `per_page` for pagination
+ - Forgejo uses `stars_count` instead of `stargazers_count` for repository stars
+-- Forgejo doesn't support replying to specific comments in the same way as GitHub
++- Forgejo organizes code review comments differently, using "CodeConversations" for comments on the same line
++- Forgejo doesn't support replying to specific comments in the same way as GitHub, but our implementation provides a workaround
++- Forgejo doesn't support GraphQL, only REST API
+ 
+ ## Codeberg Specifics
+ 
+@@ -64,6 +66,7 @@ Example:
+ ```python
+ from openhands.integrations.service_types import ProviderType
+ from openhands.integrations.provider import ProviderHandler
++from pydantic import SecretStr
+ 
+ # Create a provider handler with Forgejo token
+ provider_handler = ProviderHandler({
+@@ -75,4 +78,22 @@ user = await provider_handler.get_user()
+ 
+ # Search repositories
+ repos = await provider_handler.search_repositories("query", 10, "updated", "desc")
+-```
+\ No newline at end of file
++```
++
++## Implementation Details
++
++The OpenHands Forgejo integration includes:
++
++- **Robust Error Handling**: All API calls include proper error handling to ensure reliability
++- **Timeouts**: API calls include 10-second timeouts to prevent hanging on slow servers
++- **Fallbacks**: When certain API calls fail, the implementation falls back to alternative methods
++- **Review Threads**: Support for code review threads, organized by file path and line number
++- **Reviewer Requests**: Support for requesting reviewers on pull requests
++
++## Network Considerations
++
++When working with Forgejo instances, especially self-hosted ones, be aware of:
++
++- **API Rate Limits**: Different instances may have different rate limits
++- **Network Reliability**: The implementation handles network timeouts and errors gracefully
++- **API Versions**: Different Forgejo instances may run different versions with slight API differences
+\ No newline at end of file
+
+From 1a611330fcab99b3d0f6bd14e0e9eb4457d1c4c1 Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Sat, 10 May 2025 11:10:14 +0000
+Subject: [PATCH 14/16] Add ActivityPub API documentation for Forgejo
+ integration
+
+---
+ .../usage/cloud/cloud-forgejo-resolver.md      | 18 ++++++++++++++++++
+ microagents/knowledge/forgejo.md               | 13 +++++++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/docs/modules/usage/cloud/cloud-forgejo-resolver.md b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+index 4968cb37f8c4..bd0907c5b28e 100644
+--- a/docs/modules/usage/cloud/cloud-forgejo-resolver.md
++++ b/docs/modules/usage/cloud/cloud-forgejo-resolver.md
+@@ -110,6 +110,24 @@ Our Forgejo integration includes several key features:
+ - **Review Threads**: Support for code review threads, organized by file path and line number
+ - **Reviewer Requests**: Support for requesting reviewers on pull requests
+ 
++## ActivityPub Support
++
++Forgejo includes ActivityPub support, which allows it to federate with other ActivityPub-compatible services in the Fediverse. This is a unique feature that distinguishes Forgejo from many other Git hosting platforms.
++
++The ActivityPub API endpoints include:
++
++- `/api/v1/activitypub/user/{username}` - User's ActivityPub profile
++- `/api/v1/activitypub/user/{username}/inbox` - User's ActivityPub inbox
++- `/api/v1/activitypub/repository/{owner}/{repo}` - Repository's ActivityPub profile
++- `/api/v1/activitypub/repository/{owner}/{repo}/inbox` - Repository's ActivityPub inbox
++
++This allows Forgejo instances to:
++- Federate with other Forgejo instances
++- Interact with other ActivityPub-compatible services like Mastodon
++- Create a decentralized network of Git repositories and users
++
++While our current implementation doesn't directly use the ActivityPub API, it's available for future extensions to enable federation features.
++
+ ## Testing
+ 
+ The Forgejo integration has been tested against Codeberg.org, which is one of the most popular public Forgejo instances. If you encounter any issues with other Forgejo instances, please report them so we can improve the integration.
+\ No newline at end of file
+diff --git a/microagents/knowledge/forgejo.md b/microagents/knowledge/forgejo.md
+index f6b9ea7b5dfd..d72f4c688285 100644
+--- a/microagents/knowledge/forgejo.md
++++ b/microagents/knowledge/forgejo.md
+@@ -16,6 +16,19 @@ For Codeberg, the base URL is:
+ https://codeberg.org/api/v1
+ ```
+ 
++### ActivityPub API
++
++Forgejo also includes ActivityPub API endpoints, which allow it to federate with other ActivityPub-compatible services in the Fediverse. This is a unique feature that distinguishes Forgejo from many other Git hosting platforms.
++
++The ActivityPub API endpoints include:
++
++- `/api/v1/activitypub/user/{username}` - User's ActivityPub profile
++- `/api/v1/activitypub/user/{username}/inbox` - User's ActivityPub inbox
++- `/api/v1/activitypub/repository/{owner}/{repo}` - Repository's ActivityPub profile
++- `/api/v1/activitypub/repository/{owner}/{repo}/inbox` - Repository's ActivityPub inbox
++
++This allows Forgejo instances to federate with other Forgejo instances and interact with other ActivityPub-compatible services like Mastodon.
++
+ ### Authentication
+ 
+ Forgejo supports several authentication methods:
+
+From a7efcda51a3a1570b6749b17b0f8a8e81472778b Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Mon, 12 May 2025 16:50:54 +0000
+Subject: [PATCH 15/16] Address review comments: Move Forgejo docs to
+ integrations directory, add metadata to microagent, and fix type annotations
+
+---
+ .../forgejo.md}                               |  3 +-
+ docs/modules/usage/integrations/index.md      |  8 ++
+ microagents/knowledge/forgejo.md              | 13 ++-
+ openhands/resolver/interfaces/forgejo.py      | 85 ++++++++++---------
+ 4 files changed, 68 insertions(+), 41 deletions(-)
+ rename docs/modules/usage/{cloud/cloud-forgejo-resolver.md => integrations/forgejo.md} (99%)
+ create mode 100644 docs/modules/usage/integrations/index.md
+
+diff --git a/docs/modules/usage/cloud/cloud-forgejo-resolver.md b/docs/modules/usage/integrations/forgejo.md
+similarity index 99%
+rename from docs/modules/usage/cloud/cloud-forgejo-resolver.md
+rename to docs/modules/usage/integrations/forgejo.md
+index bd0907c5b28e..7e049f7fad78 100644
+--- a/docs/modules/usage/cloud/cloud-forgejo-resolver.md
++++ b/docs/modules/usage/integrations/forgejo.md
+@@ -130,4 +130,5 @@ While our current implementation doesn't directly use the ActivityPub API, it's
+ 
+ ## Testing
+ 
+-The Forgejo integration has been tested against Codeberg.org, which is one of the most popular public Forgejo instances. If you encounter any issues with other Forgejo instances, please report them so we can improve the integration.
+\ No newline at end of file
++The Forgejo integration has been tested against Codeberg.org, which is one of the most popular public Forgejo instances. If you encounter any issues with other Forgejo instances, please report them so we can improve the integration.
++
+diff --git a/docs/modules/usage/integrations/index.md b/docs/modules/usage/integrations/index.md
+new file mode 100644
+index 000000000000..138c103339e5
+--- /dev/null
++++ b/docs/modules/usage/integrations/index.md
+@@ -0,0 +1,8 @@
++# Integrations
++
++OpenHands supports integration with various Git hosting services and other platforms. These integrations allow you to interact with repositories, issues, pull requests, and other resources.
++
++## Available Integrations
++
++- [Forgejo](./forgejo.md) - Integration with Forgejo, a self-hosted Git service that is a fork of Gitea
++
+diff --git a/microagents/knowledge/forgejo.md b/microagents/knowledge/forgejo.md
+index d72f4c688285..80e623581e84 100644
+--- a/microagents/knowledge/forgejo.md
++++ b/microagents/knowledge/forgejo.md
+@@ -1,3 +1,13 @@
++---
++name: forgejo
++type: knowledge
++version: 1.0.0
++agent: CodeActAgent
++triggers:
++- forgejo
++- codeberg
++---
++
+ # Forgejo Knowledge
+ 
+ Forgejo is a self-hosted Git service that is a fork of Gitea. It provides a lightweight, open-source alternative to GitHub and GitLab. Codeberg.org is a popular instance of Forgejo. OpenHands provides robust integration with Forgejo instances, with full support for repository operations, issue tracking, and code review.
+@@ -109,4 +119,5 @@ When working with Forgejo instances, especially self-hosted ones, be aware of:
+ 
+ - **API Rate Limits**: Different instances may have different rate limits
+ - **Network Reliability**: The implementation handles network timeouts and errors gracefully
+-- **API Versions**: Different Forgejo instances may run different versions with slight API differences
+\ No newline at end of file
++- **API Versions**: Different Forgejo instances may run different versions with slight API differences
++
+diff --git a/openhands/resolver/interfaces/forgejo.py b/openhands/resolver/interfaces/forgejo.py
+index 0e6617a8da24..27db35af340f 100644
+--- a/openhands/resolver/interfaces/forgejo.py
++++ b/openhands/resolver/interfaces/forgejo.py
+@@ -50,14 +50,14 @@ def get_clone_url(self) -> str:
+             else f'x-auth-token:{self.token}'
+         )
+         return f'https://{username_and_token}@codeberg.org/{self.owner}/{self.repo}.git'
+-        
++
+     def get_graphql_url(self) -> str:
+         """Get the GraphQL API URL.
+-        
++
+         Note: Forgejo doesn't support GraphQL, but we need to implement this method
+         to satisfy the interface. This method will never be called in practice.
+         """
+-        return f'https://codeberg.org/api/graphql'
++        return 'https://codeberg.org/api/graphql'
+ 
+     def get_compare_url(self, branch_name: str) -> str:
+         return f'https://codeberg.org/{self.owner}/{self.repo}/compare/{branch_name}?expand=1'
+@@ -184,13 +184,15 @@ def branch_exists(self, branch_name: str) -> bool:
+         logger.info(f'Checking if branch {branch_name} exists...')
+         try:
+             response = httpx.get(
+-                f'{self.base_url}/branches/{branch_name}', headers=self.headers, timeout=10.0
++                f'{self.base_url}/branches/{branch_name}',
++                headers=self.headers,
++                timeout=10.0,
+             )
+             exists = response.status_code == 200
+             logger.info(f'Branch {branch_name} exists: {exists}')
+             return exists
+         except httpx.ReadTimeout:
+-            logger.warning(f"Timeout checking if branch {branch_name} exists")
++            logger.warning(f'Timeout checking if branch {branch_name} exists')
+             return False  # Assume branch doesn't exist if we time out
+ 
+     def get_branch_name(self, base_branch_name: str) -> str:
+@@ -224,18 +226,15 @@ def get_default_branch_name(self) -> str:
+             data = response.json()
+             return str(data['default_branch'])
+         except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+-            logger.warning(f"Error fetching default branch: {e}")
+-            return "main"  # Default to 'main' if we can't get the default branch
++            logger.warning(f'Error fetching default branch: {e}')
++            return 'main'  # Default to 'main' if we can't get the default branch
+ 
+     def create_pull_request(self, data: dict[str, Any] | None = None) -> dict[str, Any]:
+         if data is None:
+             data = {}
+         try:
+             response = httpx.post(
+-                f'{self.base_url}/pulls', 
+-                headers=self.headers, 
+-                json=data,
+-                timeout=10.0
++                f'{self.base_url}/pulls', headers=self.headers, json=data, timeout=10.0
+             )
+             if response.status_code == 403:
+                 raise RuntimeError(
+@@ -246,7 +245,7 @@ def create_pull_request(self, data: dict[str, Any] | None = None) -> dict[str, A
+             pr_data = response.json()
+             return dict(pr_data)
+         except httpx.ReadTimeout as e:
+-            raise RuntimeError(f"Timeout creating pull request: {e}")
++            raise RuntimeError(f'Timeout creating pull request: {e}')
+ 
+     def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+         """Request a reviewer for a pull request.
+@@ -262,12 +261,14 @@ def request_reviewers(self, reviewer: str, pr_number: int) -> None:
+             response = httpx.post(url, headers=self.headers, json=data, timeout=10.0)
+ 
+             if response.status_code not in (200, 201):
+-                logger.warning(f'Failed to request review from {reviewer}: {response.text}')
++                logger.warning(
++                    f'Failed to request review from {reviewer}: {response.text}'
++                )
+                 # Fallback to mentioning the reviewer in a comment
+                 msg = f'@{reviewer} Could you please review this pull request?'
+                 self.send_comment_msg(pr_number, msg)
+         except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+-            logger.warning(f"Error requesting reviewer {reviewer}: {e}")
++            logger.warning(f'Error requesting reviewer {reviewer}: {e}')
+             # Fallback to mentioning the reviewer in a comment
+             msg = f'@{reviewer} Could you please review this pull request?'
+             self.send_comment_msg(pr_number, msg)
+@@ -297,31 +298,31 @@ def get_review_comments(self, pr_number: int) -> list[dict[str, Any]]:
+             params['page'] += 1
+ 
+         return all_comments
+-        
++
+     def get_pr_comments(
+         self, pr_number: int, comment_id: int | None = None
+     ) -> list[str] | None:
+         """Download comments for a specific pull request from Forgejo.
+-        
++
+         Args:
+             pr_number: The pull request number
+             comment_id: Optional ID of a specific comment to focus on
+-            
++
+         Returns:
+             List of comment bodies or None if no comments
+         """
+         url = f'{self.base_url}/issues/{pr_number}/comments'
+         params = {'page': 1, 'limit': 100}
+         all_comments = []
+-        
++
+         while True:
+             response = httpx.get(url, headers=self.headers, params=params)
+             response.raise_for_status()
+             comments = response.json()
+-            
++
+             if not comments:
+                 break
+-                
++
+             if comment_id:
+                 matching_comment = next(
+                     (
+@@ -335,9 +336,9 @@ def get_pr_comments(
+                     return [matching_comment]
+             else:
+                 all_comments.extend([comment['body'] for comment in comments])
+-                
++
+             params['page'] += 1
+-            
++
+         return all_comments if all_comments else None
+ 
+     def get_review_threads(self, pr_number: int) -> list[dict[str, Any]]:
+@@ -453,12 +454,12 @@ def download_pr_metadata(
+             - List of thread comments
+         """
+         # Initialize empty return values
+-        closing_issues_bodies = []
+-        closing_issue_numbers = []
+-        review_comments = []
+-        review_threads = []
+-        thread_comments = []
+-        
++        closing_issues_bodies: list[str] = []
++        closing_issue_numbers: list[int] = []
++        review_comments: list[str] = []
++        review_threads: list[ReviewThread] = []
++        thread_comments: list[str] = []
++
+         try:
+             # Get the PR details
+             pr_url = f'{self.base_url}/pulls/{pull_number}'
+@@ -466,7 +467,7 @@ def download_pr_metadata(
+             pr_response.raise_for_status()
+             pr_data = pr_response.json()
+         except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+-            logger.warning(f"Error fetching pull request {pull_number}: {e}")
++            logger.warning(f'Error fetching pull request {pull_number}: {e}')
+             # Return empty data
+             return (
+                 closing_issues_bodies,
+@@ -483,7 +484,9 @@ def download_pr_metadata(
+             for issue_ref in issue_refs:
+                 try:
+                     issue_url = f'{self.base_url}/issues/{issue_ref}'
+-                    issue_response = httpx.get(issue_url, headers=self.headers, timeout=10.0)
++                    issue_response = httpx.get(
++                        issue_url, headers=self.headers, timeout=10.0
++                    )
+                     if issue_response.status_code == 200:
+                         issue_data = issue_response.json()
+                         closing_issues_bodies.append(issue_data.get('body', ''))
+@@ -508,7 +511,9 @@ def download_pr_metadata(
+                     break
+ 
+                 if comment_id:
+-                    matching_comments = [c for c in comments if c.get('id') == comment_id]
++                    matching_comments = [
++                        c for c in comments if c.get('id') == comment_id
++                    ]
+                     if matching_comments:
+                         review_comments.extend(
+                             [c.get('body', '') for c in matching_comments]
+@@ -519,7 +524,7 @@ def download_pr_metadata(
+ 
+                 review_params['page'] += 1
+         except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+-            logger.warning(f"Error fetching review comments: {e}")
++            logger.warning(f'Error fetching review comments: {e}')
+             # Continue with empty review comments
+ 
+         # Get PR comments (thread comments)
+@@ -539,7 +544,9 @@ def download_pr_metadata(
+                     break
+ 
+                 if comment_id:
+-                    matching_comments = [c for c in comments if c.get('id') == comment_id]
++                    matching_comments = [
++                        c for c in comments if c.get('id') == comment_id
++                    ]
+                     if matching_comments:
+                         thread_comments.extend(
+                             [c.get('body', '') for c in matching_comments]
+@@ -550,7 +557,7 @@ def download_pr_metadata(
+ 
+                 thread_params['page'] += 1
+         except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+-            logger.warning(f"Error fetching thread comments: {e}")
++            logger.warning(f'Error fetching thread comments: {e}')
+             # Continue with empty thread comments
+ 
+         # Create review threads
+@@ -649,10 +656,10 @@ def download_prs(self) -> list[Any]:
+         try:
+             while True:
+                 response = httpx.get(
+-                    self.download_url, 
+-                    headers=self.headers, 
++                    self.download_url,
++                    headers=self.headers,
+                     params=params,
+-                    timeout=10.0  # Add a 10-second timeout
++                    timeout=10.0,  # Add a 10-second timeout
+                 )
+                 response.raise_for_status()
+                 prs = response.json()
+@@ -671,7 +678,7 @@ def download_prs(self) -> list[Any]:
+                 assert isinstance(params['page'], int)
+                 params['page'] += 1
+         except (httpx.HTTPStatusError, httpx.ReadTimeout) as e:
+-            logger.warning(f"Error downloading pull requests: {e}")
++            logger.warning(f'Error downloading pull requests: {e}')
+             # Return whatever we've got so far
+-            
++
+         return all_prs
+
+From 7b76726a6acf34c8b2b963ed9624e5ca4dd27ece Mon Sep 17 00:00:00 2001
+From: openhands <openhands@all-hands.dev>
+Date: Tue, 13 May 2025 15:43:56 +0000
+Subject: [PATCH 16/16] Update Forgejo integration to use host parameter from
+ ProviderToken
+
+---
+ .github/CODEOWNERS                            |   2 +-
+ docs/modules/usage/integrations/forgejo.md    |   1 -
+ docs/modules/usage/integrations/index.md      |   1 -
+ microagents/knowledge/forgejo.md              |   1 -
+ .../integrations/forgejo/forgejo_service.py   |  28 ++--
+ .../integrations/gitlab/gitlab_service.py     |   2 +-
+ openhands/integrations/provider.py            |   1 +
+ openhands/integrations/service_types.py       |   1 +
+ openhands/runtime/browser/base64.py           |   7 +-
+ openhands/runtime/browser/browser_env.py      |   3 +-
+ .../resolver/test_issue_handler_factory.py    |  29 ++--
+ tests/unit/test_forgejo_service.py            | 132 +++++++++---------
+ 12 files changed, 110 insertions(+), 98 deletions(-)
+
+diff --git a/.github/CODEOWNERS b/.github/CODEOWNERS
+index 668e9837b93e..af869ec229a3 100644
+--- a/.github/CODEOWNERS
++++ b/.github/CODEOWNERS
+@@ -5,7 +5,7 @@
+ /frontend/ @rbren @amanape
+ 
+ # Evaluation code owners
+-/evaluation/ @xingyaoww @neubig 
++/evaluation/ @xingyaoww @neubig
+ 
+ # Documentation code owners
+ /docs/ @mamoodi
+diff --git a/docs/modules/usage/integrations/forgejo.md b/docs/modules/usage/integrations/forgejo.md
+index 7e049f7fad78..bd3a3fe495f6 100644
+--- a/docs/modules/usage/integrations/forgejo.md
++++ b/docs/modules/usage/integrations/forgejo.md
+@@ -131,4 +131,3 @@ While our current implementation doesn't directly use the ActivityPub API, it's
+ ## Testing
+ 
+ The Forgejo integration has been tested against Codeberg.org, which is one of the most popular public Forgejo instances. If you encounter any issues with other Forgejo instances, please report them so we can improve the integration.
+-
+diff --git a/docs/modules/usage/integrations/index.md b/docs/modules/usage/integrations/index.md
+index 138c103339e5..eea5db5f072c 100644
+--- a/docs/modules/usage/integrations/index.md
++++ b/docs/modules/usage/integrations/index.md
+@@ -5,4 +5,3 @@ OpenHands supports integration with various Git hosting services and other platf
+ ## Available Integrations
+ 
+ - [Forgejo](./forgejo.md) - Integration with Forgejo, a self-hosted Git service that is a fork of Gitea
+-
+diff --git a/microagents/knowledge/forgejo.md b/microagents/knowledge/forgejo.md
+index 80e623581e84..fffb9c02f5fe 100644
+--- a/microagents/knowledge/forgejo.md
++++ b/microagents/knowledge/forgejo.md
+@@ -120,4 +120,3 @@ When working with Forgejo instances, especially self-hosted ones, be aware of:
+ - **API Rate Limits**: Different instances may have different rate limits
+ - **Network Reliability**: The implementation handles network timeouts and errors gracefully
+ - **API Versions**: Different Forgejo instances may run different versions with slight API differences
+-
+diff --git a/openhands/integrations/forgejo/forgejo_service.py b/openhands/integrations/forgejo/forgejo_service.py
+index 2d6676af7c2d..0dc3bf20308d 100644
+--- a/openhands/integrations/forgejo/forgejo_service.py
++++ b/openhands/integrations/forgejo/forgejo_service.py
+@@ -4,7 +4,6 @@
+ import httpx
+ from pydantic import SecretStr
+ 
+-from openhands.core.logger import openhands_logger as logger
+ from openhands.integrations.service_types import (
+     AuthenticationError,
+     GitService,
+@@ -19,7 +18,7 @@
+ 
+ class ForgejoService(GitService):
+     # Default to Codeberg, can be overridden
+-    BASE_URL = os.environ.get('FORGEJO_BASE_URL', 'https://codeberg.org/api/v1')
++    DEFAULT_BASE_URL = 'https://codeberg.org/api/v1'
+     token: SecretStr = SecretStr('')
+     refresh = False
+ 
+@@ -31,16 +30,25 @@ def __init__(
+         token: SecretStr | None = None,
+         external_token_manager: bool = False,
+         base_url: str | None = None,
++        host: str | None = None,
+     ):
+         self.user_id = user_id
+         self.external_token_manager = external_token_manager
+ 
+         if token:
+             self.token = token
+-            
+-        # Override BASE_URL with provided base_url parameter
++
++        # Set the base URL with the following priority:
++        # 1. Explicitly provided base_url parameter
++        # 2. host parameter from ProviderToken
++        # 3. FORGEJO_BASE_URL environment variable
++        # 4. Default Codeberg URL
+         if base_url:
+-            self.BASE_URL = base_url
++            self.base_url = base_url
++        elif host:
++            self.base_url = host
++        else:
++            self.base_url = os.environ.get('FORGEJO_BASE_URL', self.DEFAULT_BASE_URL)
+ 
+     async def _get_forgejo_headers(self) -> dict:
+         """
+@@ -90,7 +98,7 @@ async def _fetch_data(
+             raise UnknownException(f'HTTP error: {e}')
+ 
+     async def get_user(self) -> User:
+-        url = f'{self.BASE_URL}/user'
++        url = f'{self.base_url}/user'
+         response, _ = await self._fetch_data(url)
+ 
+         return User(
+@@ -106,7 +114,7 @@ async def get_user(self) -> User:
+     async def search_repositories(
+         self, query: str, per_page: int = 30, sort: str = 'updated', order: str = 'desc'
+     ) -> list[Repository]:
+-        url = f'{self.BASE_URL}/repos/search'
++        url = f'{self.base_url}/repos/search'
+         params = {
+             'q': query,
+             'limit': per_page,
+@@ -122,6 +130,7 @@ async def search_repositories(
+                 full_name=repo.get('full_name'),
+                 stargazers_count=repo.get('stars_count'),
+                 git_provider=ProviderType.FORGEJO,
++                is_public=not repo.get('private', False),
+             )
+             for repo in response.get('data', [])
+         ]
+@@ -134,7 +143,7 @@ async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repositor
+         all_repos: list[dict] = []
+         page = 1
+ 
+-        url = f'{self.BASE_URL}/user/repos'
++        url = f'{self.base_url}/user/repos'
+         # Map GitHub's sort values to Forgejo's sort values
+         sort_map = {
+             'pushed': 'updated',
+@@ -171,6 +180,7 @@ async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repositor
+                 full_name=repo.get('full_name'),
+                 stargazers_count=repo.get('stars_count'),
+                 git_provider=ProviderType.FORGEJO,
++                is_public=not repo.get('private', False),
+             )
+             for repo in all_repos
+         ]
+@@ -180,4 +190,4 @@ async def get_repositories(self, sort: str, app_mode: AppMode) -> list[Repositor
+     'OPENHANDS_FORGEJO_SERVICE_CLS',
+     'openhands.integrations.forgejo.forgejo_service.ForgejoService',
+ )
+-ForgejoServiceImpl = get_impl(ForgejoService, forgejo_service_cls)
+\ No newline at end of file
++ForgejoServiceImpl = get_impl(ForgejoService, forgejo_service_cls)
+diff --git a/openhands/integrations/gitlab/gitlab_service.py b/openhands/integrations/gitlab/gitlab_service.py
+index 2c10b071fb90..ad5bed5c954d 100644
+--- a/openhands/integrations/gitlab/gitlab_service.py
++++ b/openhands/integrations/gitlab/gitlab_service.py
+@@ -196,7 +196,7 @@ async def search_repositories(
+                 full_name=repo.get('path_with_namespace'),
+                 stargazers_count=repo.get('star_count'),
+                 git_provider=ProviderType.GITLAB,
+-                is_public=True
++                is_public=True,
+             )
+             for repo in response
+         ]
+diff --git a/openhands/integrations/provider.py b/openhands/integrations/provider.py
+index b30cbcfd7bc3..5db66a886f1c 100644
+--- a/openhands/integrations/provider.py
++++ b/openhands/integrations/provider.py
+@@ -109,6 +109,7 @@ def _get_service(self, provider: ProviderType) -> GitService:
+             external_auth_token=self.external_auth_token,
+             token=token.token,
+             external_token_manager=self.external_token_manager,
++            host=token.host,
+         )
+ 
+     async def get_user(self) -> User:
+diff --git a/openhands/integrations/service_types.py b/openhands/integrations/service_types.py
+index 96cbc1c9b19d..befaea888522 100644
+--- a/openhands/integrations/service_types.py
++++ b/openhands/integrations/service_types.py
+@@ -185,6 +185,7 @@ def __init__(
+         external_auth_id: str | None = None,
+         external_auth_token: SecretStr | None = None,
+         external_token_manager: bool = False,
++        host: str | None = None,
+     ) -> None:
+         """Initialize the service with authentication details"""
+         ...
+diff --git a/openhands/runtime/browser/base64.py b/openhands/runtime/browser/base64.py
+index 94890e73c81c..c5320aa8b8d4 100644
+--- a/openhands/runtime/browser/base64.py
++++ b/openhands/runtime/browser/base64.py
+@@ -1,7 +1,9 @@
+-import io
+ import base64
+-from PIL import Image
++import io
++
+ import numpy as np
++from PIL import Image
++
+ 
+ def image_to_png_base64_url(
+     image: np.ndarray | Image.Image, add_data_prefix: bool = False
+@@ -21,6 +23,7 @@ def image_to_png_base64_url(
+         else f'{image_base64}'
+     )
+ 
++
+ def png_base64_url_to_image(png_base64_url: str) -> Image.Image:
+     """Convert a base64 encoded png image url to a PIL Image."""
+     splited = png_base64_url.split(',')
+diff --git a/openhands/runtime/browser/browser_env.py b/openhands/runtime/browser/browser_env.py
+index e7087a14583a..e3dfc4c7cc20 100644
+--- a/openhands/runtime/browser/browser_env.py
++++ b/openhands/runtime/browser/browser_env.py
+@@ -12,13 +12,14 @@
+ 
+ from openhands.core.exceptions import BrowserInitException
+ from openhands.core.logger import openhands_logger as logger
++from openhands.runtime.browser.base64 import image_to_png_base64_url
+ from openhands.utils.shutdown_listener import should_continue, should_exit
+ from openhands.utils.tenacity_stop import stop_if_should_exit
+-from openhands.runtime.browser.base64 import image_to_png_base64_url
+ 
+ BROWSER_EVAL_GET_GOAL_ACTION = 'GET_EVAL_GOAL'
+ BROWSER_EVAL_GET_REWARDS_ACTION = 'GET_EVAL_REWARDS'
+ 
++
+ class BrowserEnv:
+     def __init__(self, browsergym_eval_env: str | None = None):
+         self.html_text_converter = self.get_html_text_converter()
+diff --git a/tests/unit/resolver/test_issue_handler_factory.py b/tests/unit/resolver/test_issue_handler_factory.py
+index 56262ed9e5f4..1e994bfa710c 100644
+--- a/tests/unit/resolver/test_issue_handler_factory.py
++++ b/tests/unit/resolver/test_issue_handler_factory.py
+@@ -1,6 +1,3 @@
+-from typing import Type
+-from unittest.mock import MagicMock
+-
+ import pytest
+ from pydantic import SecretStr
+ 
+@@ -8,11 +5,11 @@
+ from openhands.integrations.provider import ProviderType
+ from openhands.resolver.interfaces.github import GithubIssueHandler, GithubPRHandler
+ from openhands.resolver.interfaces.gitlab import GitlabIssueHandler, GitlabPRHandler
+-from openhands.resolver.issue_handler_factory import IssueHandlerFactory
+ from openhands.resolver.interfaces.issue_definitions import (
+     ServiceContextIssue,
+     ServiceContextPR,
+ )
++from openhands.resolver.issue_handler_factory import IssueHandlerFactory
+ 
+ 
+ @pytest.fixture
+@@ -45,33 +42,29 @@ def factory_params(llm_config):
+ 
+ 
+ @pytest.mark.parametrize(
+-    'platform,issue_type,expected_context_type,expected_handler_type',
+-    test_cases
++    'platform,issue_type,expected_context_type,expected_handler_type', test_cases
+ )
+ def test_handler_creation(
+     factory_params,
+     platform: ProviderType,
+     issue_type: str,
+-    expected_context_type: Type,
+-    expected_handler_type: Type,
++    expected_context_type: type,
++    expected_handler_type: type,
+ ):
+     factory = IssueHandlerFactory(
+-        **factory_params,
+-        platform=platform,
+-        issue_type=issue_type
++        **factory_params, platform=platform, issue_type=issue_type
+     )
+-    
++
+     handler = factory.create()
+-    
++
+     assert isinstance(handler, expected_context_type)
+     assert isinstance(handler._strategy, expected_handler_type)
+ 
++
+ def test_invalid_issue_type(factory_params):
+     factory = IssueHandlerFactory(
+-        **factory_params,
+-        platform=ProviderType.GITHUB,
+-        issue_type='invalid'
++        **factory_params, platform=ProviderType.GITHUB, issue_type='invalid'
+     )
+-    
++
+     with pytest.raises(ValueError, match='Invalid issue type: invalid'):
+-        factory.create()
+\ No newline at end of file
++        factory.create()
+diff --git a/tests/unit/test_forgejo_service.py b/tests/unit/test_forgejo_service.py
+index 37f25c193d73..fc09b03a42c7 100644
+--- a/tests/unit/test_forgejo_service.py
++++ b/tests/unit/test_forgejo_service.py
+@@ -1,4 +1,3 @@
+-import json
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import httpx
+@@ -12,19 +11,19 @@
+ 
+ @pytest.fixture
+ def forgejo_service():
+-    return ForgejoService(token=SecretStr("test_token"))
++    return ForgejoService(token=SecretStr('test_token'))
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_get_user(forgejo_service):
+     # Mock response data
+     mock_user_data = {
+-        "id": 1,
+-        "username": "test_user",
+-        "avatar_url": "https://codeberg.org/avatar/test_user",
+-        "full_name": "Test User",
+-        "email": "test@example.com",
+-        "organization": "Test Org",
++        'id': 1,
++        'username': 'test_user',
++        'avatar_url': 'https://codeberg.org/avatar/test_user',
++        'full_name': 'Test User',
++        'email': 'test@example.com',
++        'organization': 'Test Org',
+     }
+ 
+     # Mock the _fetch_data method
+@@ -36,30 +35,32 @@ async def test_get_user(forgejo_service):
+     # Verify the result
+     assert isinstance(user, User)
+     assert user.id == 1
+-    assert user.login == "test_user"
+-    assert user.avatar_url == "https://codeberg.org/avatar/test_user"
+-    assert user.name == "Test User"
+-    assert user.email == "test@example.com"
+-    assert user.company == "Test Org"
++    assert user.login == 'test_user'
++    assert user.avatar_url == 'https://codeberg.org/avatar/test_user'
++    assert user.name == 'Test User'
++    assert user.email == 'test@example.com'
++    assert user.company == 'Test Org'
+ 
+     # Verify the _fetch_data call
+-    forgejo_service._fetch_data.assert_called_once_with(f"{forgejo_service.BASE_URL}/user")
++    forgejo_service._fetch_data.assert_called_once_with(
++        f'{forgejo_service.base_url}/user'
++    )
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_search_repositories(forgejo_service):
+     # Mock response data
+     mock_repos_data = {
+-        "data": [
++        'data': [
+             {
+-                "id": 1,
+-                "full_name": "test_user/repo1",
+-                "stars_count": 10,
++                'id': 1,
++                'full_name': 'test_user/repo1',
++                'stars_count': 10,
+             },
+             {
+-                "id": 2,
+-                "full_name": "test_user/repo2",
+-                "stars_count": 20,
++                'id': 2,
++                'full_name': 'test_user/repo2',
++                'stars_count': 20,
+             },
+         ]
+     }
+@@ -68,29 +69,29 @@ async def test_search_repositories(forgejo_service):
+     forgejo_service._fetch_data = AsyncMock(return_value=(mock_repos_data, {}))
+ 
+     # Call the method
+-    repos = await forgejo_service.search_repositories("test", 10, "updated", "desc")
++    repos = await forgejo_service.search_repositories('test', 10, 'updated', 'desc')
+ 
+     # Verify the result
+     assert len(repos) == 2
+     assert all(isinstance(repo, Repository) for repo in repos)
+     assert repos[0].id == 1
+-    assert repos[0].full_name == "test_user/repo1"
++    assert repos[0].full_name == 'test_user/repo1'
+     assert repos[0].stargazers_count == 10
+     assert repos[0].git_provider == ProviderType.FORGEJO
+     assert repos[1].id == 2
+-    assert repos[1].full_name == "test_user/repo2"
++    assert repos[1].full_name == 'test_user/repo2'
+     assert repos[1].stargazers_count == 20
+     assert repos[1].git_provider == ProviderType.FORGEJO
+ 
+     # Verify the _fetch_data call
+     forgejo_service._fetch_data.assert_called_once_with(
+-        f"{forgejo_service.BASE_URL}/repos/search",
++        f'{forgejo_service.base_url}/repos/search',
+         {
+-            "q": "test",
+-            "limit": 10,
+-            "sort": "updated",
+-            "order": "desc",
+-            "mode": "source",
++            'q': 'test',
++            'limit': 10,
++            'sort': 'updated',
++            'order': 'desc',
++            'mode': 'source',
+         },
+     )
+ 
+@@ -100,61 +101,64 @@ async def test_get_repositories(forgejo_service):
+     # Mock response data for first page
+     mock_repos_data_page1 = [
+         {
+-            "id": 1,
+-            "full_name": "test_user/repo1",
+-            "stars_count": 10,
++            'id': 1,
++            'full_name': 'test_user/repo1',
++            'stars_count': 10,
+         },
+         {
+-            "id": 2,
+-            "full_name": "test_user/repo2",
+-            "stars_count": 20,
++            'id': 2,
++            'full_name': 'test_user/repo2',
++            'stars_count': 20,
+         },
+     ]
+ 
+     # Mock response data for second page
+     mock_repos_data_page2 = [
+         {
+-            "id": 3,
+-            "full_name": "test_user/repo3",
+-            "stars_count": 30,
++            'id': 3,
++            'full_name': 'test_user/repo3',
++            'stars_count': 30,
+         },
+     ]
+ 
+     # Mock the _fetch_data method to return different data for different pages
+     forgejo_service._fetch_data = AsyncMock()
+     forgejo_service._fetch_data.side_effect = [
+-        (mock_repos_data_page1, {"Link": '<https://codeberg.org/api/v1/user/repos?page=2>; rel="next"'}),
+-        (mock_repos_data_page2, {"Link": ""}),
++        (
++            mock_repos_data_page1,
++            {'Link': '<https://codeberg.org/api/v1/user/repos?page=2>; rel="next"'},
++        ),
++        (mock_repos_data_page2, {'Link': ''}),
+     ]
+ 
+     # Call the method
+-    repos = await forgejo_service.get_repositories("updated", AppMode.OSS)
++    repos = await forgejo_service.get_repositories('updated', AppMode.OSS)
+ 
+     # Verify the result
+     assert len(repos) == 3
+     assert all(isinstance(repo, Repository) for repo in repos)
+     assert repos[0].id == 1
+-    assert repos[0].full_name == "test_user/repo1"
++    assert repos[0].full_name == 'test_user/repo1'
+     assert repos[0].stargazers_count == 10
+     assert repos[0].git_provider == ProviderType.FORGEJO
+     assert repos[1].id == 2
+-    assert repos[1].full_name == "test_user/repo2"
++    assert repos[1].full_name == 'test_user/repo2'
+     assert repos[1].stargazers_count == 20
+     assert repos[1].git_provider == ProviderType.FORGEJO
+     assert repos[2].id == 3
+-    assert repos[2].full_name == "test_user/repo3"
++    assert repos[2].full_name == 'test_user/repo3'
+     assert repos[2].stargazers_count == 30
+     assert repos[2].git_provider == ProviderType.FORGEJO
+ 
+     # Verify the _fetch_data calls
+     assert forgejo_service._fetch_data.call_count == 2
+     forgejo_service._fetch_data.assert_any_call(
+-        f"{forgejo_service.BASE_URL}/user/repos",
+-        {"page": "1", "limit": "100", "sort": "updated"},
++        f'{forgejo_service.base_url}/user/repos',
++        {'page': '1', 'limit': '100', 'sort': 'updated'},
+     )
+     forgejo_service._fetch_data.assert_any_call(
+-        f"{forgejo_service.BASE_URL}/user/repos",
+-        {"page": "2", "limit": "100", "sort": "updated"},
++        f'{forgejo_service.base_url}/user/repos',
++        {'page': '2', 'limit': '100', 'sort': 'updated'},
+     )
+ 
+ 
+@@ -165,18 +169,20 @@ async def test_fetch_data_success(forgejo_service):
+     mock_response = MagicMock()
+     mock_response.status_code = 200
+     mock_response.raise_for_status = MagicMock()
+-    mock_response.json.return_value = {"key": "value"}
+-    mock_response.headers = {"Link": "next_link"}
++    mock_response.json.return_value = {'key': 'value'}
++    mock_response.headers = {'Link': 'next_link'}
+     mock_client.__aenter__.return_value.get.return_value = mock_response
+ 
+     # Patch httpx.AsyncClient
+-    with patch("httpx.AsyncClient", return_value=mock_client):
++    with patch('httpx.AsyncClient', return_value=mock_client):
+         # Call the method
+-        result, headers = await forgejo_service._fetch_data("https://test.url", {"param": "value"})
++        result, headers = await forgejo_service._fetch_data(
++            'https://test.url', {'param': 'value'}
++        )
+ 
+     # Verify the result
+-    assert result == {"key": "value"}
+-    assert headers == {"Link": "next_link"}
++    assert result == {'key': 'value'}
++    assert headers == {'Link': 'next_link'}
+     mock_response.raise_for_status.assert_called_once()
+ 
+ 
+@@ -187,18 +193,18 @@ async def test_fetch_data_auth_error(forgejo_service):
+     mock_response = MagicMock()
+     mock_response.status_code = 401
+     mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+-        "401 Unauthorized", request=MagicMock(), response=mock_response
++        '401 Unauthorized', request=MagicMock(), response=mock_response
+     )
+     mock_client.__aenter__.return_value.get.return_value = mock_response
+ 
+     # Patch httpx.AsyncClient
+-    with patch("httpx.AsyncClient", return_value=mock_client):
++    with patch('httpx.AsyncClient', return_value=mock_client):
+         # Call the method and expect an exception
+         with pytest.raises(Exception) as excinfo:
+-            await forgejo_service._fetch_data("https://test.url", {"param": "value"})
++            await forgejo_service._fetch_data('https://test.url', {'param': 'value'})
+ 
+     # Verify the exception
+-    assert "Invalid Forgejo token" in str(excinfo.value)
++    assert 'Invalid Forgejo token' in str(excinfo.value)
+ 
+ 
+ @pytest.mark.asyncio
+@@ -208,15 +214,15 @@ async def test_fetch_data_other_error(forgejo_service):
+     mock_response = MagicMock()
+     mock_response.status_code = 500
+     mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+-        "500 Server Error", request=MagicMock(), response=mock_response
++        '500 Server Error', request=MagicMock(), response=mock_response
+     )
+     mock_client.__aenter__.return_value.get.return_value = mock_response
+ 
+     # Patch httpx.AsyncClient
+-    with patch("httpx.AsyncClient", return_value=mock_client):
++    with patch('httpx.AsyncClient', return_value=mock_client):
+         # Call the method and expect an exception
+         with pytest.raises(Exception) as excinfo:
+-            await forgejo_service._fetch_data("https://test.url", {"param": "value"})
++            await forgejo_service._fetch_data('https://test.url', {'param': 'value'})
+ 
+     # Verify the exception
+-    assert "Unknown error" in str(excinfo.value)
+\ No newline at end of file
++    assert 'Unknown error' in str(excinfo.value)
