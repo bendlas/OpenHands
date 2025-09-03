@@ -1,13 +1,8 @@
-from types import MappingProxyType
-from typing import cast
-
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
-from pydantic import SecretStr
 
 from openhands.core.logger import openhands_logger as logger
 from openhands.integrations.provider import (
-    PROVIDER_TOKEN_TYPE,
     ProviderHandler,
 )
 from openhands.integrations.service_types import (
@@ -26,8 +21,7 @@ from openhands.microagent.types import (
 from openhands.server.dependencies import get_dependencies
 from openhands.server.shared import server_config
 from openhands.server.user_auth import (
-    get_access_token,
-    get_provider_tokens,
+    get_provider_handler,
     get_user_id,
 )
 
@@ -37,21 +31,14 @@ app = APIRouter(prefix='/api/user', dependencies=get_dependencies())
 @app.get('/installations', response_model=list[str])
 async def get_user_installations(
     provider: ProviderType,
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ):
-    if provider_tokens:
-        client = ProviderHandler(
-            provider_tokens=provider_tokens,
-            external_auth_token=access_token,
-            external_auth_id=user_id,
-        )
-
+    if provider_handler.integrations or provider_handler.provider_tokens:
         if provider == ProviderType.GITHUB:
-            return await client.get_github_installations()
+            return await provider_handler.get_github_installations()
         elif provider == ProviderType.BITBUCKET:
-            return await client.get_bitbucket_workspaces()
+            return await provider_handler.get_bitbucket_workspaces()
         else:
             return JSONResponse(
                 content=f"Provider {provider} doesn't support installations",
@@ -71,19 +58,12 @@ async def get_user_repositories(
     page: int | None = None,
     per_page: int | None = None,
     installation_id: str | None = None,
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> list[Repository] | JSONResponse:
-    if provider_tokens:
-        client = ProviderHandler(
-            provider_tokens=provider_tokens,
-            external_auth_token=access_token,
-            external_auth_id=user_id,
-        )
-
+    if provider_handler.integrations or provider_handler.provider_tokens:
         try:
-            return await client.get_repositories(
+            return await provider_handler.get_repositories(
                 sort,
                 server_config.app_mode,
                 selected_provider,
@@ -118,17 +98,12 @@ async def get_user_repositories(
 
 @app.get('/info', response_model=User)
 async def get_user(
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> User | JSONResponse:
-    if provider_tokens:
-        client = ProviderHandler(
-            provider_tokens=provider_tokens, external_auth_token=access_token
-        )
-
+    if provider_handler.integrations or provider_handler.provider_tokens:
         try:
-            user: User = await client.get_user()
+            user: User = await provider_handler.get_user()
             return user
 
         except AuthenticationError as e:
@@ -162,18 +137,12 @@ async def search_repositories(
     sort: str = 'stars',
     order: str = 'desc',
     selected_provider: ProviderType | None = None,
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> list[Repository] | JSONResponse:
-    if provider_tokens:
-        client = ProviderHandler(
-            provider_tokens=provider_tokens,
-            external_auth_token=access_token,
-            external_auth_id=user_id,
-        )
+    if provider_handler.integrations or provider_handler.provider_tokens:
         try:
-            repos: list[Repository] = await client.search_repositories(
+            repos: list[Repository] = await provider_handler.search_repositories(
                 selected_provider, query, per_page, sort, order
             )
             return repos
@@ -201,8 +170,7 @@ async def search_repositories(
 
 @app.get('/suggested-tasks', response_model=list[SuggestedTask])
 async def get_suggested_tasks(
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> list[SuggestedTask] | JSONResponse:
     """Get suggested tasks for the authenticated user across their most recently pushed repositories.
@@ -211,12 +179,9 @@ async def get_suggested_tasks(
     - PRs owned by the user
     - Issues assigned to the user.
     """
-    if provider_tokens:
-        client = ProviderHandler(
-            provider_tokens=provider_tokens, external_auth_token=access_token
-        )
+    if provider_handler.integrations or provider_handler.provider_tokens:
         try:
-            tasks: list[SuggestedTask] = await client.get_suggested_tasks()
+            tasks: list[SuggestedTask] = await provider_handler.get_suggested_tasks()
             return tasks
 
         except AuthenticationError as e:
@@ -241,8 +206,7 @@ async def get_suggested_tasks(
 @app.get('/repository/branches', response_model=list[Branch])
 async def get_repository_branches(
     repository: str,
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> list[Branch] | JSONResponse:
     """Get branches for a repository.
@@ -253,12 +217,9 @@ async def get_repository_branches(
     Returns:
         A list of branches for the repository
     """
-    if provider_tokens:
-        client = ProviderHandler(
-            provider_tokens=provider_tokens, external_auth_token=access_token
-        )
+    if provider_handler.integrations or provider_handler.provider_tokens:
         try:
-            branches: list[Branch] = await client.get_branches(repository)
+            branches: list[Branch] = await provider_handler.get_branches(repository)
             return branches
 
         except AuthenticationError as e:
@@ -301,8 +262,7 @@ def _extract_repo_name(repository_name: str) -> str:
 )
 async def get_repository_microagents(
     repository_name: str,
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> list[MicroagentResponse] | JSONResponse:
     """Scan the microagents directory of a repository and return the list of microagents.
@@ -317,22 +277,13 @@ async def get_repository_microagents(
 
     Args:
         repository_name: Repository name in the format 'owner/repo' or 'domain/owner/repo'
-        provider_tokens: Provider tokens for authentication
-        access_token: Access token for external authentication
+        provider_handler: Provider handler for authentication
         user_id: User ID for authentication
 
     Returns:
         List of microagents found in the repository's microagents directory (without content)
     """
     try:
-        # Create provider handler for API authentication
-        provider_handler = ProviderHandler(
-            provider_tokens=provider_tokens
-            or cast(PROVIDER_TOKEN_TYPE, MappingProxyType({})),
-            external_auth_token=access_token,
-            external_auth_id=user_id,
-        )
-
         # Fetch microagents using the provider handler
         microagents = await provider_handler.get_microagents(repository_name)
 
@@ -373,8 +324,7 @@ async def get_repository_microagent_content(
     file_path: str = Query(
         ..., description='Path to the microagent file within the repository'
     ),
-    provider_tokens: PROVIDER_TOKEN_TYPE | None = Depends(get_provider_tokens),
-    access_token: SecretStr | None = Depends(get_access_token),
+    provider_handler: ProviderHandler = Depends(get_provider_handler),
     user_id: str | None = Depends(get_user_id),
 ) -> MicroagentContentResponse | JSONResponse:
     """Fetch the content of a specific microagent file from a repository.
@@ -382,8 +332,7 @@ async def get_repository_microagent_content(
     Args:
         repository_name: Repository name in the format 'owner/repo' or 'domain/owner/repo'
         file_path: Query parameter - Path to the microagent file within the repository
-        provider_tokens: Provider tokens for authentication
-        access_token: Access token for external authentication
+        provider_handler: Provider handler for authentication
         user_id: User ID for authentication
 
     Returns:
@@ -393,14 +342,6 @@ async def get_repository_microagent_content(
         GET /api/user/repository/owner/repo/microagents/content?file_path=.openhands/microagents/my-agent.md
     """
     try:
-        # Create provider handler for API authentication
-        provider_handler = ProviderHandler(
-            provider_tokens=provider_tokens
-            or cast(PROVIDER_TOKEN_TYPE, MappingProxyType({})),
-            external_auth_token=access_token,
-            external_auth_id=user_id,
-        )
-
         # Fetch file content using the provider handler
         response = await provider_handler.get_microagent_content(
             repository_name, file_path

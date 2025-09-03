@@ -67,15 +67,29 @@ async def get_integrations(request: Request) -> list[Integration]:
 async def get_provider_handler(request: Request) -> ProviderHandler:
     """Get a ProviderHandler for the current user using integrations when available"""
     integrations = await get_integrations(request)
+    access_token = await get_access_token(request)
+    user_id = await get_user_id(request)
     
     if integrations:
         # Use the new integrations-based approach
-        return ProviderHandler(integrations=integrations)
+        return ProviderHandler(
+            integrations=integrations,
+            external_auth_token=access_token,
+            external_auth_id=user_id,
+        )
     else:
         # Fall back to legacy provider tokens
         provider_tokens = await get_provider_tokens(request)
         if provider_tokens:
-            return ProviderHandler(provider_tokens=provider_tokens)
+            return ProviderHandler(
+                provider_tokens=provider_tokens,
+                external_auth_token=access_token,
+                external_auth_id=user_id,
+            )
         else:
             # Return empty handler
-            return ProviderHandler(integrations=[])
+            return ProviderHandler(
+                integrations=[],
+                external_auth_token=access_token,
+                external_auth_id=user_id,
+            )
