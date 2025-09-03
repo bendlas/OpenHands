@@ -4,7 +4,13 @@ import {
   GetSecretsResponse,
   POSTProviderTokens,
 } from "./secrets-service.types";
-import { Integration, IntegrationCreateData, IntegrationUpdateData, Provider, ProviderToken } from "#/types/settings";
+import {
+  Integration,
+  IntegrationCreateData,
+  IntegrationUpdateData,
+  Provider,
+  ProviderToken,
+} from "#/types/settings";
 
 export class SecretsService {
   static async getSecrets() {
@@ -51,22 +57,34 @@ export class SecretsService {
 
   // New integration management APIs
   static async getIntegrations(): Promise<Integration[]> {
-    const { data } = await openHands.get<{ integrations: Integration[] }>("/api/integrations");
+    const { data } = await openHands.get<{ integrations: Integration[] }>(
+      "/api/integrations",
+    );
     return data.integrations;
   }
 
-  static async createIntegration(integration: IntegrationCreateData): Promise<boolean> {
+  static async createIntegration(
+    integration: IntegrationCreateData,
+  ): Promise<boolean> {
     const { status } = await openHands.post("/api/integrations", integration);
     return status === 201;
   }
 
-  static async updateIntegration(integrationId: string, integration: IntegrationUpdateData): Promise<boolean> {
-    const { status } = await openHands.put(`/api/integrations/${integrationId}`, integration);
+  static async updateIntegration(
+    integrationId: string,
+    integration: IntegrationUpdateData,
+  ): Promise<boolean> {
+    const { status } = await openHands.put(
+      `/api/integrations/${integrationId}`,
+      integration,
+    );
     return status === 200;
   }
 
   static async deleteIntegration(integrationId: string): Promise<boolean> {
-    const { status } = await openHands.delete(`/api/integrations/${integrationId}`);
+    const { status } = await openHands.delete(
+      `/api/integrations/${integrationId}`,
+    );
     return status === 200;
   }
 }
