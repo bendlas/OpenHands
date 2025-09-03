@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, status
+from fastapi.requests import Request
 from fastapi.responses import JSONResponse
 from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, ConfigDict, Field
@@ -55,6 +56,7 @@ from openhands.server.shared import (
 from openhands.server.types import LLMAuthenticationError, MissingSettingsError
 from openhands.server.user_auth import (
     get_auth_type,
+    get_provider_handler,
     get_provider_tokens,
     get_user_id,
     get_user_secrets,
@@ -111,6 +113,7 @@ class ProvidersSetModel(BaseModel):
 
 @app.post('/conversations')
 async def new_conversation(
+    request: Request,
     data: InitSessionRequest,
     user_id: str = Depends(get_user_id),
     provider_tokens: PROVIDER_TOKEN_TYPE = Depends(get_provider_tokens),
@@ -164,7 +167,7 @@ async def new_conversation(
 
     try:
         if repository:
-            provider_handler = ProviderHandler(provider_tokens)
+            provider_handler = await get_provider_handler(request)
             # Check against git_provider, otherwise check all provider apis
             await provider_handler.verify_repo_provider(repository, git_provider)
 

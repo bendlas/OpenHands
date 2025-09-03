@@ -12,6 +12,36 @@ export type ProviderToken = {
   host: string | null;
 };
 
+// New integration types for dynamic provider management
+export type Integration = {
+  id: string;
+  provider_type: string;
+  name: string;
+  host: string | null;
+  user_id: string | null;
+  has_token: boolean; // For security, actual tokens are not returned by GET API
+};
+
+export type IntegrationCreateData = {
+  id?: string; // Optional in form data - frontend will generate if not provided
+  provider_type: string;
+  name: string;
+  host?: string | null;
+  token?: string | null;
+  user_id?: string | null;
+};
+
+export type IntegrationApiPayload = {
+  id: string; // Required for API - frontend must provide
+  provider_type: string;
+  name: string;
+  host?: string | null;
+  token?: string | null;
+  user_id?: string | null;
+};
+
+export type IntegrationUpdateData = IntegrationCreateData;
+
 export type MCPSSEServer = {
   url: string;
   api_key?: string;

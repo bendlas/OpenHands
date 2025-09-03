@@ -15,10 +15,12 @@ from openhands.server.shared import config
 from openhands.server.user_auth import (
     get_provider_tokens,
     get_secrets_store,
+    get_user_secrets,
     get_user_settings,
     get_user_settings_store,
 )
 from openhands.storage.data_models.settings import Settings
+from openhands.storage.data_models.user_secrets import UserSecrets
 from openhands.storage.secrets.secrets_store import SecretsStore
 from openhands.storage.settings.settings_store import SettingsStore
 
@@ -38,6 +40,7 @@ async def load_settings(
     settings_store: SettingsStore = Depends(get_user_settings_store),
     settings: Settings = Depends(get_user_settings),
     secrets_store: SecretsStore = Depends(get_secrets_store),
+    user_secrets: UserSecrets | None = Depends(get_user_secrets),
 ) -> GETSettingsModel | JSONResponse:
     try:
         if not settings:
@@ -47,13 +50,16 @@ async def load_settings(
             )
 
         # On initial load, user secrets may not be populated with values migrated from settings store
-        user_secrets = await invalidate_legacy_secrets_store(
+        migrated_user_secrets = await invalidate_legacy_secrets_store(
             settings, settings_store, secrets_store
         )
 
+        # Use the most recent user secrets (either from migration or current)
+        current_user_secrets = migrated_user_secrets if migrated_user_secrets else user_secrets
+
         # If invalidation is successful, then the returned user secrets holds the most recent values
         git_providers = (
-            user_secrets.provider_tokens if user_secrets else provider_tokens
+            current_user_secrets.provider_tokens if current_user_secrets else provider_tokens
         )
 
         provider_tokens_set: dict[ProviderType, str | None] = {}
@@ -61,6 +67,22 @@ async def load_settings(
             for provider_type, provider_token in git_providers.items():
                 if provider_token.token or provider_token.user_id:
                     provider_tokens_set[provider_type] = provider_token.host
+
+        # Also check for integrations and add them to provider_tokens_set
+        # This ensures the frontend recognizes that providers are available
+        if current_user_secrets and current_user_secrets.integrations:
+            for integration in current_user_secrets.integrations:
+                try:
+                    # Map integration provider_type to ProviderType enum if possible
+                    provider_type = ProviderType(integration.provider_type)
+                    
+                    # Include integrations in provider_tokens_set regardless of token status
+                    # This allows public GitHub connections and other tokenless integrations
+                    # to be recognized by the frontend
+                    provider_tokens_set[provider_type] = integration.host
+                except ValueError:
+                    # Skip unknown provider types that don't map to ProviderType enum
+                    continue
 
         settings_with_token_data = GETSettingsModel(
             **settings.model_dump(exclude={'secrets_store'}),
