@@ -1,0 +1,182 @@
+name: Copilot Setup Steps for Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of tests to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'integration_tests'
+          - 'runtime'
+          - 'e2e'
+
+jobs:
+  setup-and-test:
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            tmux \
+            libgtk-3-0 \
+            libnotify4 \
+            libnss3 \
+            libxss1 \
+            libxtst6 \
+            xauth \
+            xvfb \
+            libgbm1 \
+            libasound2t64 \
+            netcat-openbsd
+
+      - name: Install poetry via pipx
+        run: pipx install poetry
+
+      - name: Set up Python
+        uses: useblacksmith/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'poetry'
+
+      - name: Setup Node.js
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: '22.x'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Python dependencies using Poetry
+        run: poetry install --with dev,test,runtime,evaluation
+
+      - name: Build Environment
+        run: make build
+
+      - name: Run Integration Tests (evaluation/integration_tests)
+        if: ${{ github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'integration_tests' }}
+        env:
+          LLM_MODEL: "gpt-4o-mini"
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || 'test-key' }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          SANDBOX_FORCE_REBUILD_RUNTIME: true
+        run: |
+          echo "Setting up config for integration tests..."
+          echo "[llm.eval]" > config.toml
+          echo "model = \"$LLM_MODEL\"" >> config.toml
+          echo "api_key = \"$LLM_API_KEY\"" >> config.toml
+          if [ -n "$LLM_BASE_URL" ]; then
+            echo "base_url = \"$LLM_BASE_URL\"" >> config.toml
+          fi
+          echo "temperature = 0.0" >> config.toml
+          
+          echo "Running integration tests using script..."
+          # Run all integration tests with limited iterations for faster testing
+          poetry run ./evaluation/integration_tests/scripts/run_infer.sh llm.eval HEAD CodeActAgent '' 5 1 '' 'copilot_test'
+          
+          echo "Running individual test validation..."
+          for test_file in evaluation/integration_tests/tests/t*.py; do
+            if [ -f "$test_file" ]; then
+              test_name=$(basename "$test_file" .py)
+              echo "Attempting individual test: $test_name"
+              poetry run ./evaluation/integration_tests/scripts/run_infer.sh llm.eval HEAD CodeActAgent '' 5 1 "$test_name" "copilot_individual_$test_name" || echo "Test $test_name failed, continuing..."
+            fi
+          done
+
+      - name: Run Runtime Tests
+        if: ${{ github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'runtime' }}
+        run: |
+          echo "Running runtime tests..."
+          poetry run pytest -v tests/runtime/ || echo "Some runtime tests failed, continuing..."
+
+      - name: Run Unit Tests
+        if: ${{ github.event.inputs.test_type == 'all' }}
+        run: |
+          echo "Running unit tests..."
+          poetry run pytest --forked -n auto -v tests/unit/ || echo "Some unit tests failed, continuing..."
+
+      - name: Setup E2E Test Environment
+        if: ${{ github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'e2e' }}
+        run: |
+          echo "Installing Playwright..."
+          poetry run playwright install chromium-headless-shell
+          
+          echo "Verifying Playwright installation..."
+          poetry run python tests/e2e/check_playwright.py || echo "Playwright check failed"
+
+      - name: Start OpenHands for E2E Tests
+        if: ${{ github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'e2e' }}
+        env:
+          LLM_MODEL: "gpt-4o-mini"
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || 'test-key' }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          FRONTEND_PORT: 12000
+          FRONTEND_HOST: 0.0.0.0
+          BACKEND_HOST: 0.0.0.0
+          BACKEND_PORT: 3000
+        run: |
+          echo "Starting OpenHands for E2E tests..."
+          FRONTEND_PORT=12000 FRONTEND_HOST=0.0.0.0 BACKEND_HOST=0.0.0.0 make run > /tmp/openhands-e2e-test.log 2>&1 &
+          
+          echo "Waiting for OpenHands to start..."
+          max_attempts=15
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Checking if OpenHands is running (attempt $attempt of $max_attempts)..."
+            
+            if nc -z localhost 12000 && curl -s http://localhost:12000 | grep -q "<html"; then
+              echo "SUCCESS: OpenHands is running on port 12000"
+              break
+            fi
+            
+            echo "Waiting 10 seconds before next check..."
+            sleep 10
+            attempt=$((attempt + 1))
+            
+            if [ $attempt -gt $max_attempts ]; then
+              echo "ERROR: OpenHands failed to start after $max_attempts attempts"
+              echo "Last 50 lines of the log:"
+              tail -n 50 /tmp/openhands-e2e-test.log
+              exit 1
+            fi
+          done
+
+      - name: Run E2E Tests
+        if: ${{ github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'e2e' }}
+        env:
+          LLM_MODEL: "gpt-4o-mini"
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || 'test-key' }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+        run: |
+          echo "Running E2E tests..."
+          cd tests/e2e
+          poetry run python -m pytest test_settings.py::test_github_token_configuration test_conversation.py::test_conversation_start -v --no-header --capture=no --timeout=600 || echo "Some E2E tests failed, continuing..."
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Stopping OpenHands processes..."
+          pkill -f "python -m openhands.server" || true
+          pkill -f "npm run dev" || true
+          pkill -f "make run" || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: |
+            /tmp/openhands-e2e-test.log
+            tests/e2e/test-results/
+            evaluation/evaluation_outputs/
+          retention-days: 7
