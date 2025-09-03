@@ -1,7 +1,7 @@
 from fastapi import Request
 from pydantic import SecretStr
 
-from openhands.integrations.provider import PROVIDER_TOKEN_TYPE
+from openhands.integrations.provider import PROVIDER_TOKEN_TYPE, Integration, ProviderHandler
 from openhands.server.settings import Settings
 from openhands.server.user_auth.user_auth import AuthType, get_user_auth
 from openhands.storage.data_models.user_secrets import UserSecrets
@@ -54,3 +54,28 @@ async def get_user_settings_store(request: Request) -> SettingsStore | None:
 async def get_auth_type(request: Request) -> AuthType | None:
     user_auth = await get_user_auth(request)
     return user_auth.get_auth_type()
+
+
+async def get_integrations(request: Request) -> list[Integration]:
+    """Get integrations for the current user"""
+    user_secrets = await get_user_secrets(request)
+    if not user_secrets:
+        return []
+    return user_secrets.integrations or []
+
+
+async def get_provider_handler(request: Request) -> ProviderHandler:
+    """Get a ProviderHandler for the current user using integrations when available"""
+    integrations = await get_integrations(request)
+    
+    if integrations:
+        # Use the new integrations-based approach
+        return ProviderHandler(integrations=integrations)
+    else:
+        # Fall back to legacy provider tokens
+        provider_tokens = await get_provider_tokens(request)
+        if provider_tokens:
+            return ProviderHandler(provider_tokens=provider_tokens)
+        else:
+            # Return empty handler
+            return ProviderHandler(integrations=[])

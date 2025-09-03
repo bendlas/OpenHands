@@ -10,6 +10,7 @@ from openhands.server.settings import (
     CustomSecretModel,
     CustomSecretWithoutValueModel,
     GETCustomSecrets,
+    POSTIntegrationModel,
     POSTProviderModel,
 )
 from openhands.server.user_auth import (
@@ -347,4 +348,253 @@ async def delete_custom_secret(
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={'error': 'Something went wrong deleting secret'},
+        )
+
+
+# =================================================
+# SECTION: Handle integrations (new dynamic system)
+# =================================================
+
+
+@app.get('/integrations')
+async def get_integrations(
+    user_secrets: UserSecrets = Depends(get_user_secrets),
+) -> JSONResponse:
+    """Get all configured integrations"""
+    try:
+        integrations = user_secrets.integrations or []
+        # Return integrations without sensitive data (tokens)
+        safe_integrations = []
+        for integration in integrations:
+            safe_integration = {
+                'id': integration.id,
+                'provider_type': integration.provider_type,
+                'name': integration.name,
+                'host': integration.host,
+                'user_id': integration.user_id,
+                'has_token': integration.token is not None and integration.token.get_secret_value() != ''
+            }
+            safe_integrations.append(safe_integration)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={'integrations': safe_integrations}
+        )
+    except Exception as e:
+        logger.warning(f'Something went wrong getting integrations: {e}')
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'error': 'Something went wrong getting integrations'},
+        )
+
+
+async def validate_integration_token(
+    provider_type: str, token: SecretStr, host: str | None = None
+) -> str:
+    """Validate an integration token and return error message if invalid"""
+    if not token or token.get_secret_value() == '':
+        return ''
+    
+    # Try to validate the token
+    confirmed_provider_type = await validate_provider_token(token, host)
+    if not confirmed_provider_type or confirmed_provider_type.value != provider_type:
+        return f'Invalid token. Please make sure it is a valid {provider_type} token.'
+    
+    return ''
+
+
+@app.post('/integrations')
+async def add_integration(
+    integration_data: POSTIntegrationModel,
+    secrets_store: SecretsStore = Depends(get_secrets_store),
+) -> JSONResponse:
+    """Add a new integration"""
+    try:
+        # Validate token if provided
+        if integration_data.token:
+            error_msg = await validate_integration_token(
+                integration_data.provider_type, 
+                integration_data.token, 
+                integration_data.host
+            )
+            if error_msg:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={'error': error_msg},
+                )
+        
+        user_secrets = await secrets_store.load()
+        if not user_secrets:
+            user_secrets = UserSecrets()
+        
+        # Check if integration ID already exists
+        existing_integrations = list(user_secrets.integrations) if user_secrets.integrations else []
+        for existing in existing_integrations:
+            if existing.id == integration_data.id:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={'error': f'Integration with ID "{integration_data.id}" already exists'},
+                )
+        
+        # Create new integration
+        new_integration = Integration(
+            id=integration_data.id,
+            provider_type=integration_data.provider_type,
+            name=integration_data.name,
+            host=integration_data.host,
+            token=integration_data.token,
+            user_id=integration_data.user_id,
+        )
+        
+        # Add to existing integrations
+        updated_integrations = existing_integrations + [new_integration]
+        
+        # Update user secrets
+        updated_secrets = user_secrets.model_copy(
+            update={'integrations': updated_integrations}
+        )
+        await secrets_store.store(updated_secrets)
+        
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content={'message': f'Integration "{integration_data.name}" added successfully'},
+        )
+    except Exception as e:
+        logger.warning(f'Something went wrong adding integration: {e}')
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'error': 'Something went wrong adding integration'},
+        )
+
+
+@app.put('/integrations/{integration_id}')
+async def update_integration(
+    integration_id: str,
+    integration_data: POSTIntegrationModel,
+    secrets_store: SecretsStore = Depends(get_secrets_store),
+) -> JSONResponse:
+    """Update an existing integration"""
+    try:
+        # Validate token if provided
+        if integration_data.token:
+            error_msg = await validate_integration_token(
+                integration_data.provider_type, 
+                integration_data.token, 
+                integration_data.host
+            )
+            if error_msg:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={'error': error_msg},
+                )
+        
+        user_secrets = await secrets_store.load()
+        if not user_secrets:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={'error': f'Integration with ID "{integration_id}" not found'},
+            )
+        
+        # Find and update the integration
+        existing_integrations = list(user_secrets.integrations) if user_secrets.integrations else []
+        updated_integrations = []
+        found = False
+        
+        for existing in existing_integrations:
+            if existing.id == integration_id:
+                # Update the existing integration, preserving token if not provided
+                token = integration_data.token if integration_data.token else existing.token
+                updated_integration = Integration(
+                    id=integration_data.id,  # Allow ID changes
+                    provider_type=integration_data.provider_type,
+                    name=integration_data.name,
+                    host=integration_data.host,
+                    token=token,
+                    user_id=integration_data.user_id,
+                )
+                updated_integrations.append(updated_integration)
+                found = True
+            else:
+                updated_integrations.append(existing)
+        
+        if not found:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={'error': f'Integration with ID "{integration_id}" not found'},
+            )
+        
+        # Check for ID conflicts if ID was changed
+        if integration_data.id != integration_id:
+            for integration in updated_integrations:
+                if integration.id == integration_data.id and integration != updated_integrations[-1]:
+                    return JSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content={'error': f'Integration with ID "{integration_data.id}" already exists'},
+                    )
+        
+        # Update user secrets
+        updated_secrets = user_secrets.model_copy(
+            update={'integrations': updated_integrations}
+        )
+        await secrets_store.store(updated_secrets)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={'message': f'Integration "{integration_data.name}" updated successfully'},
+        )
+    except Exception as e:
+        logger.warning(f'Something went wrong updating integration: {e}')
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'error': 'Something went wrong updating integration'},
+        )
+
+
+@app.delete('/integrations/{integration_id}')
+async def delete_integration(
+    integration_id: str,
+    secrets_store: SecretsStore = Depends(get_secrets_store),
+) -> JSONResponse:
+    """Delete an integration"""
+    try:
+        user_secrets = await secrets_store.load()
+        if not user_secrets:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={'error': f'Integration with ID "{integration_id}" not found'},
+            )
+        
+        # Find and remove the integration
+        existing_integrations = list(user_secrets.integrations) if user_secrets.integrations else []
+        updated_integrations = []
+        found = False
+        
+        for existing in existing_integrations:
+            if existing.id == integration_id:
+                found = True
+                # Skip this integration (remove it)
+            else:
+                updated_integrations.append(existing)
+        
+        if not found:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={'error': f'Integration with ID "{integration_id}" not found'},
+            )
+        
+        # Update user secrets
+        updated_secrets = user_secrets.model_copy(
+            update={'integrations': updated_integrations}
+        )
+        await secrets_store.store(updated_secrets)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={'message': f'Integration "{integration_id}" deleted successfully'},
+        )
+    except Exception as e:
+        logger.warning(f'Something went wrong deleting integration: {e}')
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'error': 'Something went wrong deleting integration'},
         )
