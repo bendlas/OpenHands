@@ -15,8 +15,9 @@ on:
           - 'e2e'
 
 jobs:
-  setup-and-test:
-    runs-on: ubuntu-22.04
+  # The job MUST be called `copilot-setup-steps` or it will not be picked up by Copilot.
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     
     steps:
