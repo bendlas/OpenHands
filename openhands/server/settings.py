@@ -7,7 +7,7 @@ from pydantic import (
 )
 
 from openhands.core.config.mcp_config import MCPConfig
-from openhands.integrations.provider import CustomSecret, ProviderToken
+from openhands.integrations.provider import CustomSecret, Integration, ProviderToken
 from openhands.integrations.service_types import ProviderType
 from openhands.storage.data_models.settings import Settings
 
@@ -17,6 +17,23 @@ class POSTProviderModel(BaseModel):
 
     mcp_config: MCPConfig | None = None
     provider_tokens: dict[ProviderType, ProviderToken] = {}
+
+
+class POSTIntegrationsModel(BaseModel):
+    """Model for posting integrations"""
+    
+    integrations: list[Integration] = []
+
+
+class POSTIntegrationModel(BaseModel):
+    """Model for posting a single integration"""
+    
+    id: str
+    provider_type: str
+    name: str
+    host: str | None = None
+    token: SecretStr | None = None
+    user_id: str | None = None
 
 
 class POSTCustomSecrets(BaseModel):
