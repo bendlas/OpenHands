@@ -411,28 +411,6 @@ async def validate_integration_token(
     return ''
 
 
-def generate_integration_id(name: str, provider_type: str, existing_ids: list[str]) -> str:
-    """Generate a unique integration ID based on name and provider type"""
-    # Convert name to a safe ID format
-    import re
-    
-    # Basic sanitization: lowercase, replace spaces/special chars with hyphens
-    base_id = re.sub(r'[^a-zA-Z0-9]+', '-', name.lower()).strip('-')
-    if not base_id:
-        # Fallback if name has no alphanumeric characters
-        base_id = provider_type.lower()
-    
-    # Try the base ID first
-    candidate_id = base_id
-    counter = 1
-    
-    # If ID already exists, append a number
-    while candidate_id in existing_ids:
-        candidate_id = f"{base_id}-{counter}"
-        counter += 1
-    
-    return candidate_id
-
 
 @app.post('/integrations')
 async def add_integration(
@@ -471,25 +449,16 @@ async def add_integration(
         existing_integrations = list(user_secrets.integrations) if user_secrets.integrations else []
         existing_ids = [integration.id for integration in existing_integrations]
         
-        # Auto-generate ID if not provided
-        integration_id = integration_data.id
-        if not integration_id:
-            integration_id = generate_integration_id(
-                integration_data.name, 
-                integration_data.provider_type, 
-                existing_ids
+        # Check if provided ID already exists
+        if integration_data.id in existing_ids:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={'error': f'Integration with ID "{integration_data.id}" already exists'},
             )
-        else:
-            # Check if provided ID already exists
-            if integration_id in existing_ids:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={'error': f'Integration with ID "{integration_id}" already exists'},
-                )
         
         # Create new integration
         new_integration = Integration(
-            id=integration_id,
+            id=integration_data.id,
             provider_type=integration_data.provider_type,
             name=integration_data.name,
             host=integration_data.host,
@@ -510,7 +479,7 @@ async def add_integration(
             status_code=status.HTTP_201_CREATED,
             content={
                 'message': f'Integration "{integration_data.name}" added successfully',
-                'id': integration_id  # Return the generated/used ID
+                'id': integration_data.id
             },
         )
     except Exception as e:

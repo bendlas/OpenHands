@@ -8,6 +8,7 @@ import {
   Integration,
   IntegrationCreateData,
   IntegrationUpdateData,
+  IntegrationApiPayload,
   Provider,
   ProviderToken,
 } from "#/types/settings";
@@ -64,7 +65,7 @@ export class SecretsService {
   }
 
   static async createIntegration(
-    integration: IntegrationCreateData,
+    integration: IntegrationApiPayload,
   ): Promise<boolean> {
     const { status } = await openHands.post("/api/integrations", integration);
     return status === 201;

@@ -1,12 +1,12 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { SecretsService } from "#/api/secrets-service";
-import { IntegrationCreateData, IntegrationUpdateData } from "#/types/settings";
+import { IntegrationCreateData, IntegrationUpdateData, IntegrationApiPayload } from "#/types/settings";
 
 export const useCreateIntegration = () => {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (integration: IntegrationCreateData) => 
+    mutationFn: (integration: IntegrationApiPayload) => 
       SecretsService.createIntegration(integration),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["integrations"] });
