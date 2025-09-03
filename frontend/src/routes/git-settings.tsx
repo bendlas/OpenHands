@@ -7,6 +7,7 @@ import { useLogout } from "#/hooks/mutation/use-logout";
 import { GitHubTokenInput } from "#/components/features/settings/git-settings/github-token-input";
 import { GitLabTokenInput } from "#/components/features/settings/git-settings/gitlab-token-input";
 import { BitbucketTokenInput } from "#/components/features/settings/git-settings/bitbucket-token-input";
+import { DynamicIntegrationManager } from "#/components/features/settings/git-settings/dynamic-integration-manager";
 import { ConfigureGitHubRepositoriesAnchor } from "#/components/features/settings/git-settings/configure-github-repositories-anchor";
 import { InstallSlackAppAnchor } from "#/components/features/settings/git-settings/install-slack-app-anchor";
 import { I18nKey } from "#/i18n/declaration";
@@ -117,9 +118,8 @@ function GitSettingsScreen() {
     config?.FEATURE_FLAGS?.ENABLE_LINEAR;
 
   return (
-    <form
+    <div
       data-testid="git-settings-screen"
-      action={formAction}
       className="flex flex-col h-full justify-between"
     >
       {!isLoading && (
@@ -155,46 +155,46 @@ function GitSettingsScreen() {
           )}
 
           <div className="flex flex-col gap-4">
-            {!isSaas && (
-              <GitHubTokenInput
-                name="github-token-input"
-                isGitHubTokenSet={isGitHubTokenSet}
-                onChange={(value) => {
-                  setGithubTokenInputHasValue(!!value);
-                }}
-                onGitHubHostChange={(value) => {
-                  setGithubHostInputHasValue(!!value);
-                }}
-                githubHostSet={existingGithubHost}
-              />
-            )}
+            {/* Use dynamic integration manager for flexible provider management */}
+            {!isSaas && <DynamicIntegrationManager />}
 
-            {!isSaas && (
-              <GitLabTokenInput
-                name="gitlab-token-input"
-                isGitLabTokenSet={isGitLabTokenSet}
-                onChange={(value) => {
-                  setGitlabTokenInputHasValue(!!value);
-                }}
-                onGitLabHostChange={(value) => {
-                  setGitlabHostInputHasValue(!!value);
-                }}
-                gitlabHostSet={existingGitlabHost}
-              />
-            )}
-
-            {!isSaas && (
-              <BitbucketTokenInput
-                name="bitbucket-token-input"
-                isBitbucketTokenSet={isBitbucketTokenSet}
-                onChange={(value) => {
-                  setBitbucketTokenInputHasValue(!!value);
-                }}
-                onBitbucketHostChange={(value) => {
-                  setBitbucketHostInputHasValue(!!value);
-                }}
-                bitbucketHostSet={existingBitbucketHost}
-              />
+            {/* Legacy provider inputs - can be removed once dynamic system is fully adopted */}
+            {false && !isSaas && (
+              <>
+                <GitHubTokenInput
+                  name="github-token-input"
+                  isGitHubTokenSet={isGitHubTokenSet}
+                  onChange={(value) => {
+                    setGithubTokenInputHasValue(!!value);
+                  }}
+                  onGitHubHostChange={(value) => {
+                    setGithubHostInputHasValue(!!value);
+                  }}
+                  githubHostSet={existingGithubHost}
+                />
+                <GitLabTokenInput
+                  name="gitlab-token-input"
+                  isGitLabTokenSet={isGitLabTokenSet}
+                  onChange={(value) => {
+                    setGitlabTokenInputHasValue(!!value);
+                  }}
+                  onGitLabHostChange={(value) => {
+                    setGitlabHostInputHasValue(!!value);
+                  }}
+                  gitlabHostSet={existingGitlabHost}
+                />
+                <BitbucketTokenInput
+                  name="bitbucket-token-input"
+                  isBitbucketTokenSet={isBitbucketTokenSet}
+                  onChange={(value) => {
+                    setBitbucketTokenInputHasValue(!!value);
+                  }}
+                  onBitbucketHostChange={(value) => {
+                    setBitbucketHostInputHasValue(!!value);
+                  }}
+                  bitbucketHostSet={existingBitbucketHost}
+                />
+              </>
             )}
           </div>
         </div>
@@ -202,33 +202,23 @@ function GitSettingsScreen() {
 
       {isLoading && <GitSettingInputsSkeleton />}
 
-      <div className="flex gap-6 p-6 justify-end border-t border-t-tertiary">
-        {!shouldRenderExternalConfigureButtons && (
-          <>
-            <BrandButton
-              testId="disconnect-tokens-button"
-              name="disconnect-tokens-button"
-              type="submit"
-              variant="secondary"
-              isDisabled={
-                !isGitHubTokenSet && !isGitLabTokenSet && !isBitbucketTokenSet
-              }
-            >
-              {t(I18nKey.GIT$DISCONNECT_TOKENS)}
-            </BrandButton>
-            <BrandButton
-              testId="submit-button"
-              type="submit"
-              variant="primary"
-              isDisabled={isPending || formIsClean}
-            >
-              {!isPending && t("SETTINGS$SAVE_CHANGES")}
-              {isPending && t("SETTINGS$SAVING")}
-            </BrandButton>
-          </>
-        )}
-      </div>
-    </form>
+      {/* Legacy form buttons - only show for external configure buttons */}
+      {shouldRenderExternalConfigureButtons && (
+        <div className="flex gap-6 p-6 justify-end border-t border-t-tertiary">
+          <BrandButton
+            type="button"
+            testId="disconnect-tokens-button"
+            onClick={() => disconnectGitTokens()}
+            variant="secondary"
+            isDisabled={
+              !isGitHubTokenSet && !isGitLabTokenSet && !isBitbucketTokenSet
+            }
+          >
+            {t(I18nKey.GIT$DISCONNECT_TOKENS)}
+          </BrandButton>
+        </div>
+      )}
+    </div>
   );
 }
 
