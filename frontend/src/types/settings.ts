@@ -23,7 +23,7 @@ export type Integration = {
 };
 
 export type IntegrationCreateData = {
-  id: string;
+  id?: string; // Make ID optional
   provider_type: string;
   name: string;
   host?: string | null;
