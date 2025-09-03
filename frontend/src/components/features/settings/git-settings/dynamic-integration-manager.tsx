@@ -285,6 +285,13 @@ const AddIntegrationForm: React.FC<AddIntegrationFormProps> = ({
       return;
     }
 
+    // Require token for certain provider types
+    const requiredTokenProviders = ['github', 'gitlab', 'bitbucket'];
+    if (requiredTokenProviders.includes(formData.provider_type) && !formData.token) {
+      displayErrorToast(`API token is required for ${formData.provider_type} integrations`);
+      return;
+    }
+
     // Use custom ID if provided, otherwise let backend auto-generate
     const submissionData = { ...formData };
     if (!showCustomId) {
@@ -410,7 +417,7 @@ const AddIntegrationForm: React.FC<AddIntegrationFormProps> = ({
 
         <div className="col-span-2">
           <label className="block text-sm font-medium text-gray-300 mb-1">
-            API Token (optional)
+            API Token *
           </label>
           <input
             type="password"
@@ -418,8 +425,9 @@ const AddIntegrationForm: React.FC<AddIntegrationFormProps> = ({
             onChange={(e) =>
               setFormData({ ...formData, token: e.target.value || null })
             }
-            placeholder="Enter your API token"
+            placeholder="Enter your API token (required)"
             className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            required
           />
         </div>
 

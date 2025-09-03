@@ -441,6 +441,15 @@ async def add_integration(
 ) -> JSONResponse:
     """Add a new integration"""
     try:
+        # Require token for certain provider types (for now)
+        # This prevents issues with public GitHub connections that aren't fully supported yet
+        required_token_providers = ['github', 'gitlab', 'bitbucket']
+        if integration_data.provider_type in required_token_providers and not integration_data.token:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={'error': f'Token is required for {integration_data.provider_type} integrations'},
+            )
+        
         # Validate token if provided
         if integration_data.token:
             error_msg = await validate_integration_token(

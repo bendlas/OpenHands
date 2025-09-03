@@ -73,11 +73,13 @@ async def load_settings(
         if current_user_secrets and current_user_secrets.integrations:
             for integration in current_user_secrets.integrations:
                 try:
-                    # Only include integrations that have tokens configured
-                    if integration.token and integration.token.get_secret_value():
-                        # Map integration provider_type to ProviderType enum if possible
-                        provider_type = ProviderType(integration.provider_type)
-                        provider_tokens_set[provider_type] = integration.host
+                    # Map integration provider_type to ProviderType enum if possible
+                    provider_type = ProviderType(integration.provider_type)
+                    
+                    # Include integrations in provider_tokens_set regardless of token status
+                    # This allows public GitHub connections and other tokenless integrations
+                    # to be recognized by the frontend
+                    provider_tokens_set[provider_type] = integration.host
                 except ValueError:
                     # Skip unknown provider types that don't map to ProviderType enum
                     continue
