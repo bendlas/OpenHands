@@ -63,6 +63,56 @@ class ProviderToken(BaseModel):
             raise ValueError('Unsupported Provider token type')
 
 
+class Integration(BaseModel):
+    """Represents a single integration instance with a git provider.
+    
+    Allows multiple instances of the same provider type (e.g., multiple GitHub accounts,
+    GitHub Enterprise instances, etc.).
+    """
+    id: str = Field(..., description="Unique identifier for this integration")
+    provider_type: str = Field(..., description="Type of provider (github, gitlab, bitbucket, gitea, etc.)")
+    name: str = Field(..., description="User-friendly display name")
+    host: str | None = Field(default=None, description="Host URL for self-hosted instances")
+    token: SecretStr | None = Field(default=None, description="API token for authentication")
+    user_id: str | None = Field(default=None, description="User ID for this provider")
+
+    model_config = ConfigDict(
+        frozen=True,
+        validate_assignment=True,
+    )
+
+    @classmethod
+    def from_legacy_provider_token(
+        cls, provider_type: ProviderType, provider_token: ProviderToken
+    ) -> Integration:
+        """Create an Integration from legacy ProviderType and ProviderToken"""
+        return cls(
+            id=provider_type.value,  # Use provider type as ID for legacy migration
+            provider_type=provider_type.value,
+            name=provider_type.value.title(),  # "github" -> "Github"
+            host=provider_token.host,
+            token=provider_token.token,
+            user_id=provider_token.user_id,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Integration:
+        """Create an Integration from a dictionary"""
+        token_str = data.get('token', '')
+        if token_str is None:
+            token_str = ''
+        token = SecretStr(token_str) if token_str else None
+        
+        return cls(
+            id=data['id'],
+            provider_type=data['provider_type'],
+            name=data['name'],
+            host=data.get('host'),
+            token=token,
+            user_id=data.get('user_id'),
+        )
+
+
 class CustomSecret(BaseModel):
     secret: SecretStr = Field(default_factory=lambda: SecretStr(''))
     description: str = Field(default='')
@@ -88,6 +138,8 @@ class CustomSecret(BaseModel):
 
 PROVIDER_TOKEN_TYPE = MappingProxyType[ProviderType, ProviderToken]
 CUSTOM_SECRETS_TYPE = MappingProxyType[str, CustomSecret]
+INTEGRATIONS_TYPE = list[Integration]
+
 PROVIDER_TOKEN_TYPE_WITH_JSON_SCHEMA = Annotated[
     PROVIDER_TOKEN_TYPE,
     WithJsonSchema({'type': 'object', 'additionalProperties': {'type': 'string'}}),
@@ -95,6 +147,10 @@ PROVIDER_TOKEN_TYPE_WITH_JSON_SCHEMA = Annotated[
 CUSTOM_SECRETS_TYPE_WITH_JSON_SCHEMA = Annotated[
     CUSTOM_SECRETS_TYPE,
     WithJsonSchema({'type': 'object', 'additionalProperties': {'type': 'string'}}),
+]
+INTEGRATIONS_TYPE_WITH_JSON_SCHEMA = Annotated[
+    INTEGRATIONS_TYPE,
+    WithJsonSchema({'type': 'array', 'items': {'type': 'object'}}),
 ]
 
 
@@ -108,36 +164,69 @@ class ProviderHandler:
 
     def __init__(
         self,
-        provider_tokens: PROVIDER_TOKEN_TYPE,
+        provider_tokens: PROVIDER_TOKEN_TYPE | None = None,
+        integrations: list[Integration] | None = None,
         external_auth_id: str | None = None,
         external_auth_token: SecretStr | None = None,
         external_token_manager: bool = False,
     ):
-        if not isinstance(provider_tokens, MappingProxyType):
-            raise TypeError(
-                f'provider_tokens must be a MappingProxyType, got {type(provider_tokens).__name__}'
-            )
+        # For backward compatibility, support both old and new initialization
+        if provider_tokens is not None and integrations is not None:
+            raise ValueError("Cannot specify both provider_tokens and integrations")
+        
+        if provider_tokens is not None:
+            if not isinstance(provider_tokens, MappingProxyType):
+                raise TypeError(
+                    f'provider_tokens must be a MappingProxyType, got {type(provider_tokens).__name__}'
+                )
+            # Convert legacy provider tokens to integrations
+            self._integrations = []
+            for provider_type, provider_token in provider_tokens.items():
+                integration = Integration.from_legacy_provider_token(provider_type, provider_token)
+                self._integrations.append(integration)
+            self._provider_tokens = provider_tokens
+        else:
+            self._integrations = integrations or []
+            # Create legacy provider_tokens mapping for backward compatibility
+            legacy_tokens = {}
+            for integration in self._integrations:
+                try:
+                    provider_type = ProviderType(integration.provider_type)
+                    provider_token = ProviderToken(
+                        token=integration.token,
+                        user_id=integration.user_id,
+                        host=integration.host
+                    )
+                    legacy_tokens[provider_type] = provider_token
+                except ValueError:
+                    # Skip unknown provider types for legacy mapping
+                    continue
+            self._provider_tokens = MappingProxyType(legacy_tokens)
 
-        self.service_class_map: dict[ProviderType, type[GitService]] = {
-            ProviderType.GITHUB: GithubServiceImpl,
-            ProviderType.GITLAB: GitLabServiceImpl,
-            ProviderType.BITBUCKET: BitBucketServiceImpl,
+        self.service_class_map: dict[str, type[GitService]] = {
+            'github': GithubServiceImpl,
+            'gitlab': GitLabServiceImpl,
+            'bitbucket': BitBucketServiceImpl,
         }
 
         self.external_auth_id = external_auth_id
         self.external_auth_token = external_auth_token
         self.external_token_manager = external_token_manager
-        self._provider_tokens = provider_tokens
 
     @property
     def provider_tokens(self) -> PROVIDER_TOKEN_TYPE:
-        """Read-only access to provider tokens."""
+        """Read-only access to provider tokens (for backward compatibility)."""
         return self._provider_tokens
 
+    @property
+    def integrations(self) -> list[Integration]:
+        """Read-only access to integrations."""
+        return self._integrations.copy()
+
     def _get_service(self, provider: ProviderType) -> GitService:
-        """Helper method to instantiate a service for a given provider"""
+        """Helper method to instantiate a service for a given provider (legacy method)"""
         token = self.provider_tokens[provider]
-        service_class = self.service_class_map[provider]
+        service_class = self.service_class_map[provider.value]
         return service_class(
             user_id=token.user_id,
             external_auth_id=self.external_auth_id,
@@ -147,8 +236,46 @@ class ProviderHandler:
             base_domain=token.host,
         )
 
+    def _get_service_for_integration(self, integration: Integration) -> GitService:
+        """Helper method to instantiate a service for a given integration"""
+        service_class = self.service_class_map.get(integration.provider_type)
+        if not service_class:
+            raise ValueError(f"Unsupported provider type: {integration.provider_type}")
+        
+        return service_class(
+            user_id=integration.user_id,
+            external_auth_id=self.external_auth_id,
+            external_auth_token=self.external_auth_token,
+            token=integration.token,
+            external_token_manager=self.external_token_manager,
+            base_domain=integration.host,
+        )
+
+    def get_integration_by_id(self, integration_id: str) -> Integration | None:
+        """Get an integration by its ID"""
+        for integration in self._integrations:
+            if integration.id == integration_id:
+                return integration
+        return None
+
+    def get_integrations_by_provider_type(self, provider_type: str) -> list[Integration]:
+        """Get all integrations for a specific provider type"""
+        return [
+            integration for integration in self._integrations
+            if integration.provider_type == provider_type
+        ]
+
     async def get_user(self) -> User:
         """Get user information from the first available provider"""
+        # Try integrations first
+        for integration in self._integrations:
+            try:
+                service = self._get_service_for_integration(integration)
+                return await service.get_user()
+            except Exception:
+                continue
+        
+        # Fall back to legacy provider tokens
         for provider in self.provider_tokens:
             try:
                 service = self._get_service(provider)
