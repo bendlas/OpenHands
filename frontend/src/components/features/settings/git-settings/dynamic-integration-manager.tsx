@@ -13,6 +13,7 @@ import {
 } from "#/utils/custom-toast-handlers";
 import { retrieveAxiosErrorMessage } from "#/utils/retrieve-axios-error-message";
 import { I18nKey } from "#/i18n/declaration";
+import { generateIntegrationId } from "#/utils/integrationUtils";
 
 // Supported provider types
 const PROVIDER_TYPES = [
@@ -23,35 +24,6 @@ const PROVIDER_TYPES = [
   { value: "forgejo", label: "Forgejo" },
   { value: "sourcehut", label: "SourceHut" },
 ];
-
-/**
- * Generate a unique integration ID based on name and provider type
- * Matches the backend logic for consistency
- */
-function generateIntegrationId(name: string, existingIds: string[]): string {
-  // Basic sanitization: lowercase, replace spaces/special chars with hyphens
-  const baseId = name
-    .toLowerCase()
-    .replace(/[^a-zA-Z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, ""); // trim leading/trailing hyphens
-
-  if (!baseId) {
-    // Fallback if name has no alphanumeric characters
-    return "integration";
-  }
-
-  // Try the base ID first
-  let candidateId = baseId;
-  let counter = 1;
-
-  // If ID already exists, append a number
-  while (existingIds.indexOf(candidateId) !== -1) {
-    candidateId = `${baseId}-${counter}`;
-    counter++;
-  }
-
-  return candidateId;
-}
 
 interface EditIntegrationFormProps {
   integration: Integration;
@@ -292,11 +264,20 @@ const AddIntegrationForm: React.FC<AddIntegrationFormProps> = ({
       return;
     }
 
-    // Use custom ID if provided, otherwise let backend auto-generate
-    const submissionData = { ...formData };
-    if (!showCustomId) {
-      delete submissionData.id; // Let backend auto-generate
+    // Always provide an ID - either custom or auto-generated
+    const integrationId = showCustomId && formData.id 
+      ? formData.id 
+      : previewId;
+    
+    if (!integrationId) {
+      displayErrorToast("Unable to generate integration ID");
+      return;
     }
+
+    const submissionData = { 
+      ...formData,
+      id: integrationId
+    };
 
     createIntegration(submissionData, {
       onSuccess: () => {

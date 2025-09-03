@@ -23,7 +23,16 @@ export type Integration = {
 };
 
 export type IntegrationCreateData = {
-  id?: string; // Make ID optional
+  id?: string; // Optional in form data - frontend will generate if not provided
+  provider_type: string;
+  name: string;
+  host?: string | null;
+  token?: string | null;
+  user_id?: string | null;
+};
+
+export type IntegrationApiPayload = {
+  id: string; // Required for API - frontend must provide
   provider_type: string;
   name: string;
   host?: string | null;
