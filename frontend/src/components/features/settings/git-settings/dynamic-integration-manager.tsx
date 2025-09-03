@@ -53,6 +53,200 @@ function generateIntegrationId(name: string, existingIds: string[]): string {
   return candidateId;
 }
 
+interface EditIntegrationFormProps {
+  integration: Integration;
+  onCancel: () => void;
+  onSuccess: () => void;
+}
+
+const EditIntegrationForm: React.FC<EditIntegrationFormProps> = ({
+  integration,
+  onCancel,
+  onSuccess,
+}) => {
+  const { t } = useTranslation();
+  const { mutate: updateIntegration, isPending } = useUpdateIntegration();
+  const { data: integrations = [] } = useIntegrations();
+
+  const [formData, setFormData] = useState<IntegrationCreateData>({
+    id: integration.id,
+    provider_type: integration.provider_type,
+    name: integration.name,
+    host: integration.host || "",
+    token: "", // Don't pre-fill token for security
+    user_id: integration.user_id || "",
+  });
+
+  const [showCustomId, setShowCustomId] = useState(true); // Always show custom for edit
+
+  // Generate preview ID based on current name (for reference)
+  const existingIds = integrations
+    .filter((int) => int.id !== integration.id) // Exclude current integration
+    .map((int) => int.id);
+  const previewId = useMemo(() => {
+    if (!formData.name.trim()) return "";
+    return generateIntegrationId(formData.name, existingIds);
+  }, [formData.name, existingIds]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!formData.name) {
+      displayErrorToast("Name is required");
+      return;
+    }
+
+    if (!formData.id) {
+      displayErrorToast("ID is required");
+      return;
+    }
+
+    // Update the integration
+    updateIntegration(
+      { id: integration.id, integration: formData },
+      {
+        onSuccess: () => {
+          displaySuccessToast(
+            `Integration "${formData.name}" updated successfully`,
+          );
+          onSuccess();
+        },
+        onError: (error) => {
+          const errorMessage = retrieveAxiosErrorMessage(error);
+          displayErrorToast(errorMessage || "Failed to update integration");
+        },
+      },
+    );
+  };
+
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className="space-y-4 bg-gray-800 p-4 rounded-lg border-2 border-blue-600"
+    >
+      <h3 className="text-lg font-medium text-white">Edit Integration</h3>
+
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-1">
+            Display Name *
+          </label>
+          <input
+            type="text"
+            value={formData.name}
+            onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+            placeholder="e.g., GitHub Personal"
+            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            required
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-1">
+            Integration ID *
+          </label>
+          <div className="relative">
+            <input
+              type="text"
+              value={formData.id || ""}
+              onChange={(e) =>
+                setFormData({ ...formData, id: e.target.value })
+              }
+              placeholder="e.g., github-personal"
+              className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              required
+            />
+          </div>
+          <p className="text-xs text-gray-400 mt-1">
+            Current ID. Suggested: {previewId}
+          </p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-1">
+            Provider Type *
+          </label>
+          <select
+            value={formData.provider_type}
+            onChange={(e) =>
+              setFormData({ ...formData, provider_type: e.target.value })
+            }
+            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            {PROVIDER_TYPES.map((type) => (
+              <option key={type.value} value={type.value}>
+                {type.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-1">
+            Host (optional)
+          </label>
+          <input
+            type="text"
+            value={formData.host || ""}
+            onChange={(e) =>
+              setFormData({ ...formData, host: e.target.value || null })
+            }
+            placeholder="e.g., github.enterprise.com"
+            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        <div className="col-span-2">
+          <label className="block text-sm font-medium text-gray-300 mb-1">
+            API Token (leave empty to keep current)
+          </label>
+          <input
+            type="password"
+            value={formData.token || ""}
+            onChange={(e) =>
+              setFormData({ ...formData, token: e.target.value || null })
+            }
+            placeholder="Enter new API token or leave empty to keep current"
+            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        <div className="col-span-2">
+          <label className="block text-sm font-medium text-gray-300 mb-1">
+            User ID (optional)
+          </label>
+          <input
+            type="text"
+            value={formData.user_id || ""}
+            onChange={(e) =>
+              setFormData({ ...formData, user_id: e.target.value || null })
+            }
+            placeholder="Your user ID for this provider"
+            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+      </div>
+
+      <div className="flex justify-end space-x-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="px-4 py-2 text-gray-300 hover:text-white transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={isPending}
+          className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {isPending ? "Updating..." : "Update Integration"}
+        </button>
+      </div>
+    </form>
+  );
+};
+
 interface AddIntegrationFormProps {
   onCancel: () => void;
   onSuccess: () => void;
@@ -320,6 +514,7 @@ export const DynamicIntegrationManager: React.FC = () => {
   const { mutate: deleteIntegration } = useDeleteIntegration();
 
   const [showAddForm, setShowAddForm] = useState(false);
+  const [editingIntegration, setEditingIntegration] = useState<Integration | null>(null);
 
   const handleDelete = (integrationId: string) => {
     // eslint-disable-next-line no-restricted-globals, no-alert
@@ -334,6 +529,19 @@ export const DynamicIntegrationManager: React.FC = () => {
         },
       });
     }
+  };
+
+  const handleEdit = (integration: Integration) => {
+    setEditingIntegration(integration);
+    setShowAddForm(false); // Close add form if open
+  };
+
+  const handleEditCancel = () => {
+    setEditingIntegration(null);
+  };
+
+  const handleEditSuccess = () => {
+    setEditingIntegration(null);
   };
 
   if (isLoading) {
@@ -353,7 +561,10 @@ export const DynamicIntegrationManager: React.FC = () => {
         </h3>
         <button
           type="button"
-          onClick={() => setShowAddForm(true)}
+          onClick={() => {
+            setShowAddForm(true);
+            setEditingIntegration(null); // Close edit form if open
+          }}
           className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
         >
           {/* eslint-disable-next-line i18next/no-literal-string */}
@@ -368,13 +579,21 @@ export const DynamicIntegrationManager: React.FC = () => {
         />
       )}
 
+      {editingIntegration && (
+        <EditIntegrationForm
+          integration={editingIntegration}
+          onCancel={handleEditCancel}
+          onSuccess={handleEditSuccess}
+        />
+      )}
+
       {integrations && integrations.length > 0 ? (
         <div className="space-y-3">
           {integrations.map((integration) => (
             <IntegrationItem
               key={integration.id}
               integration={integration}
-              onEdit={() => {}} // TODO: Implement edit functionality
+              onEdit={handleEdit}
               onDelete={handleDelete}
             />
           ))}
