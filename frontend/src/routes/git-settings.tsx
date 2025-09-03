@@ -157,7 +157,7 @@ function GitSettingsScreen() {
           <div className="flex flex-col gap-4">
             {/* Use dynamic integration manager for flexible provider management */}
             {!isSaas && <DynamicIntegrationManager />}
-            
+
             {/* Legacy provider inputs - can be removed once dynamic system is fully adopted */}
             {false && !isSaas && (
               <>
@@ -206,6 +206,7 @@ function GitSettingsScreen() {
       {shouldRenderExternalConfigureButtons && (
         <div className="flex gap-6 p-6 justify-end border-t border-t-tertiary">
           <BrandButton
+            type="button"
             testId="disconnect-tokens-button"
             onClick={() => disconnectGitTokens()}
             variant="secondary"
