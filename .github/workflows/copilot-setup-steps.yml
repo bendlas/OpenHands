@@ -30,7 +30,7 @@ jobs:
           virtualenvs-in-project: false
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
 
