@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import SecretStr
 
 from openhands.core.logger import openhands_logger as logger
-from openhands.integrations.provider import PROVIDER_TOKEN_TYPE, CustomSecret
+from openhands.integrations.provider import PROVIDER_TOKEN_TYPE, CustomSecret, Integration
 from openhands.integrations.service_types import ProviderType
 from openhands.integrations.utils import validate_provider_token
 from openhands.server.dependencies import get_dependencies
@@ -359,10 +359,17 @@ async def delete_custom_secret(
 
 @app.get('/integrations')
 async def get_integrations(
-    user_secrets: UserSecrets = Depends(get_user_secrets),
+    user_secrets: UserSecrets | None = Depends(get_user_secrets),
 ) -> JSONResponse:
     """Get all configured integrations"""
     try:
+        # Handle case where user_secrets is None
+        if not user_secrets:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={'integrations': []}
+            )
+        
         integrations = user_secrets.integrations or []
         # Return integrations without sensitive data (tokens)
         safe_integrations = []
@@ -404,6 +411,29 @@ async def validate_integration_token(
     return ''
 
 
+def generate_integration_id(name: str, provider_type: str, existing_ids: list[str]) -> str:
+    """Generate a unique integration ID based on name and provider type"""
+    # Convert name to a safe ID format
+    import re
+    
+    # Basic sanitization: lowercase, replace spaces/special chars with hyphens
+    base_id = re.sub(r'[^a-zA-Z0-9]+', '-', name.lower()).strip('-')
+    if not base_id:
+        # Fallback if name has no alphanumeric characters
+        base_id = provider_type.lower()
+    
+    # Try the base ID first
+    candidate_id = base_id
+    counter = 1
+    
+    # If ID already exists, append a number
+    while candidate_id in existing_ids:
+        candidate_id = f"{base_id}-{counter}"
+        counter += 1
+    
+    return candidate_id
+
+
 @app.post('/integrations')
 async def add_integration(
     integration_data: POSTIntegrationModel,
@@ -428,18 +458,29 @@ async def add_integration(
         if not user_secrets:
             user_secrets = UserSecrets()
         
-        # Check if integration ID already exists
+        # Get existing integrations and their IDs
         existing_integrations = list(user_secrets.integrations) if user_secrets.integrations else []
-        for existing in existing_integrations:
-            if existing.id == integration_data.id:
+        existing_ids = [integration.id for integration in existing_integrations]
+        
+        # Auto-generate ID if not provided
+        integration_id = integration_data.id
+        if not integration_id:
+            integration_id = generate_integration_id(
+                integration_data.name, 
+                integration_data.provider_type, 
+                existing_ids
+            )
+        else:
+            # Check if provided ID already exists
+            if integration_id in existing_ids:
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    content={'error': f'Integration with ID "{integration_data.id}" already exists'},
+                    content={'error': f'Integration with ID "{integration_id}" already exists'},
                 )
         
         # Create new integration
         new_integration = Integration(
-            id=integration_data.id,
+            id=integration_id,
             provider_type=integration_data.provider_type,
             name=integration_data.name,
             host=integration_data.host,
@@ -458,7 +499,10 @@ async def add_integration(
         
         return JSONResponse(
             status_code=status.HTTP_201_CREATED,
-            content={'message': f'Integration "{integration_data.name}" added successfully'},
+            content={
+                'message': f'Integration "{integration_data.name}" added successfully',
+                'id': integration_id  # Return the generated/used ID
+            },
         )
     except Exception as e:
         logger.warning(f'Something went wrong adding integration: {e}')
@@ -501,12 +545,15 @@ async def update_integration(
         updated_integrations = []
         found = False
         
+        # Determine the new ID - use provided ID or keep the current one
+        new_integration_id = integration_data.id if integration_data.id is not None else integration_id
+        
         for existing in existing_integrations:
             if existing.id == integration_id:
                 # Update the existing integration, preserving token if not provided
                 token = integration_data.token if integration_data.token else existing.token
                 updated_integration = Integration(
-                    id=integration_data.id,  # Allow ID changes
+                    id=new_integration_id,
                     provider_type=integration_data.provider_type,
                     name=integration_data.name,
                     host=integration_data.host,
@@ -525,13 +572,13 @@ async def update_integration(
             )
         
         # Check for ID conflicts if ID was changed
-        if integration_data.id != integration_id:
-            for integration in updated_integrations:
-                if integration.id == integration_data.id and integration != updated_integrations[-1]:
-                    return JSONResponse(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        content={'error': f'Integration with ID "{integration_data.id}" already exists'},
-                    )
+        if new_integration_id != integration_id:
+            existing_ids = [integration.id for integration in updated_integrations if integration.id != new_integration_id]
+            if new_integration_id in existing_ids:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={'error': f'Integration with ID "{new_integration_id}" already exists'},
+                )
         
         # Update user secrets
         updated_secrets = user_secrets.model_copy(

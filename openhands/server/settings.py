@@ -28,7 +28,7 @@ class POSTIntegrationsModel(BaseModel):
 class POSTIntegrationModel(BaseModel):
     """Model for posting a single integration"""
     
-    id: str
+    id: str | None = None  # Make ID optional
     provider_type: str
     name: str
     host: str | None = None
