@@ -40,4 +40,6 @@ class FileSettingsStore(SettingsStore):
             file_store_web_hook_headers=config.file_store_web_hook_headers,
             file_store_web_hook_batch=config.file_store_web_hook_batch,
         )
-        return FileSettingsStore(file_store)
+        # Scope settings to user directory if user_id is provided
+        path = f'users/{user_id}/settings.json' if user_id else 'settings.json'
+        return FileSettingsStore(file_store=file_store, path=path)

@@ -26,8 +26,9 @@ class ServerConfig(ServerConfigInterface):
         'openhands.server.conversation_manager.standalone_conversation_manager.StandaloneConversationManager',
     )
     monitoring_listener_class: str = 'openhands.server.monitoring.MonitoringListener'
-    user_auth_class: str = (
-        'openhands.server.user_auth.default_user_auth.DefaultUserAuth'
+    user_auth_class: str = os.environ.get(
+        'OPENHANDS_USER_AUTH_CLS',
+        'openhands.server.user_auth.default_user_auth.DefaultUserAuth',
     )
 
     def verify_config(self):
